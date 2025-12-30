@@ -1,0 +1,19 @@
+[project]
+name = "cafa6"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beartype>=0.22.9",
+    "biopython>=1.86",
+    "equinox>=0.13.2",
+    "grain>=0.2.15",
+    "jax[cuda13]>=0.8.2",
+    "mlflow>=3.8.1",
+    "obonet>=1.1.1",
+    "optax>=0.2.6",
+    "polars>=1.36.1",
+    "pydantic>=2.12.5",
+    "tqdm>=4.67.1",
+]
