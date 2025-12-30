@@ -1,7 +1,15 @@
+from pathlib import Path
+
 import numpy as np
 import obonet
+import polars as pl
 
-from cafa6.constants import OBO_GRAPH_CHILDREN_PATH, OBO_GRAPH_PARENTS_PATH, OBO_PATH
+from cafa6.constants import (
+    OBO_GRAPH_CHILDREN_PATH,
+    OBO_GRAPH_PARENTS_PATH,
+    OBO_PATH,
+    TERM_TO_IDX_LOOKUP_PATH,
+)
 
 
 def get_graph_edges(terms_to_idx: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -41,3 +49,16 @@ def get_graph_edges(terms_to_idx: dict) -> tuple[np.ndarray, np.ndarray]:
     np.save(OBO_GRAPH_CHILDREN_PATH, children)
     np.save(OBO_GRAPH_PARENTS_PATH, parents)
     return children, parents
+
+
+def get_go_term_weights(
+    term_to_idx_lookup_path: str | Path = TERM_TO_IDX_LOOKUP_PATH,
+) -> np.ndarray:
+    if not Path(term_to_idx_lookup_path).exists():
+        raise FileNotFoundError(
+            "Couldn't find the lookup dir! Run scripts/cafa6_terms_to_idx.py!"
+        )
+    df = pl.read_csv(term_to_idx_lookup_path)
+    col = df.select(pl.col("weight"))
+    col = np.array(col)
+    return col
