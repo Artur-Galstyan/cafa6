@@ -10,6 +10,7 @@ dependencies = [
     "equinox>=0.13.2",
     "grain>=0.2.15",
     "jax[cuda13]>=0.8.2",
+    "loguru>=0.7.3",
     "mlflow>=3.8.1",
     "obonet>=1.1.1",
     "optax>=0.2.6",
