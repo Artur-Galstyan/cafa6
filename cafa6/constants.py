@@ -26,3 +26,4 @@ TERM_TO_IDX_LOOKUP_PATH = DATA_BASE_PATH / "term_to_idx_lookup.tsv"
 
 TEST_SUPERSET_TAXON_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-list.tsv"
 TEST_SUPERSET_TAXON_LOOKUP_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-lookup.tsv"
+PARTIAL_SUBMISSION_PATH = DATA_BASE_PATH / "partial_submission.csv"

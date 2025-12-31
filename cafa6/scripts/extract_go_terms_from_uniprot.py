@@ -3,13 +3,17 @@ import gzip
 from pathlib import Path
 
 import polars as pl
+from Bio import SeqIO
+from loguru import logger
 from tqdm import tqdm
 
 from cafa6.constants import (
     DATA_BASE_PATH,
     GOA_UNIPROT_ALL_GAF_PATH,
     GOA_UNIPROT_TEST_PREDS_PATH,
+    PARTIAL_SUBMISSION_PATH,
     TERM_TO_IDX_LOOKUP_PATH,
+    TEST_FASTA_PATH,
 )
 
 
@@ -97,5 +101,27 @@ def extract_go_terms_from_uniprot(
     return df
 
 
+def get_existing_go_terms_for_testset(
+    test_fasta_path: str | Path = TEST_FASTA_PATH,
+    partial_submission_path: str | Path = PARTIAL_SUBMISSION_PATH,
+):
+    protein_ids_set = set()
+    for record in tqdm(SeqIO.parse(test_fasta_path, "fasta")):
+        protein_id = record.id
+        protein_ids_set.add(protein_id)
+
+    chunk_paths = []
+    total_chunks = 23  # you get this number if you ran the above function
+    for chunk in range(total_chunks):
+        chunk_paths.append(DATA_BASE_PATH / f"{chunk}.csv")
+
+    lazy_df = pl.scan_csv(chunk_paths)
+    protein_ids_list = list(protein_ids_set)
+    filtered_lazy = lazy_df.filter(pl.col("EntryID").is_in(protein_ids_list))
+
+    filtered_lazy.sink_csv(partial_submission_path)
+
+
 if __name__ == "__main__":
-    extract_go_terms_from_uniprot()
+    # extract_go_terms_from_uniprot()
+    get_existing_go_terms_for_testset()
