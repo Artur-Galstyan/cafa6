@@ -82,7 +82,7 @@ def max_f1_masked(preds: Array, labels: Array, weights: Array, mask: Array) -> A
     return jnp.max(f1s)
 
 
-def evaluate(preds: Array, labels: Array) -> Array:
+def _evaluate(preds: Array, labels: Array) -> Array:
     weights = jnp.array(get_go_term_weights())
     term_to_aspect = build_term_to_aspect()
     if not TERM_TO_IDX_LOOKUP_PATH.exists():
@@ -104,7 +104,7 @@ def evaluate(preds: Array, labels: Array) -> Array:
     return _eval()
 
 
-def eval(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
+def evaluate(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
     all_preds = []
     all_labels = []
 
@@ -140,7 +140,7 @@ def eval(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
     all_preds = jnp.concatenate(all_preds, axis=0)
     all_labels = jnp.concatenate(all_labels, axis=0)
 
-    return evaluate(
+    return _evaluate(
         all_preds,
         all_labels,
     )

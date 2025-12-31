@@ -7,6 +7,7 @@ MODEL_TO_DIMS: dict[str, int] = {
 ESM_MODEL = "esmc_600m"
 
 DATA_BASE_PATH = pathlib.Path(__file__).parent.parent / "data"
+WEIGHTS_BASE_PATH = pathlib.Path(__file__).parent.parent / "weights"
 EMBEDDINGS_PATH = DATA_BASE_PATH / "embeddings"
 
 TRAIN_FASTA_PATH = DATA_BASE_PATH / "train/train_sequences.fasta"

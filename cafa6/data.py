@@ -103,7 +103,7 @@ def get_datasources(
         str(train_fasta_path), str(train_terms_path), val_indices
     )
 
-    return train_data_source, val_data_source
+    return train_data_source, val_data_source, n_total
 
 
 class MapTermsToArrayAndEmbeddings(Map):
@@ -206,7 +206,7 @@ def get_dataloaders(batch_size: int = 128, num_epochs: int = 8, worker_count: in
         Batch(batch_size=batch_size),
     ]
 
-    train_data_source, val_data_source = get_datasources()
+    train_data_source, val_data_source, n_total = get_datasources()
 
     train_sampler = IndexSampler(
         num_records=len(train_data_source),
@@ -236,14 +236,4 @@ def get_dataloaders(batch_size: int = 128, num_epochs: int = 8, worker_count: in
         worker_count=0,
     )
 
-    return train_loader, val_loader
-
-
-if __name__ == "__main__":
-    train_loader, _ = get_dataloaders(batch_size=1)
-
-    for d in train_loader:
-        protein_id, embeddings_esm, neighbor_prior, taxon, mask, labels = d
-        print(f"{taxon=}")
-        print(f"{mask.shape=}")
-        break
+    return train_loader, val_loader, n_total
