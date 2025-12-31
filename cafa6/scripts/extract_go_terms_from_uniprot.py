@@ -1,11 +1,16 @@
+import gc
 import gzip
 from pathlib import Path
 
 import polars as pl
-from loguru import logger
 from tqdm import tqdm
 
-from cafa6.constants import GOA_UNIPROT_ALL_GAF_PATH, GOA_UNIPROT_TEST_PREDS_PATH
+from cafa6.constants import (
+    DATA_BASE_PATH,
+    GOA_UNIPROT_ALL_GAF_PATH,
+    GOA_UNIPROT_TEST_PREDS_PATH,
+    TERM_TO_IDX_LOOKUP_PATH,
+)
 
 
 def extract_go_terms_from_uniprot(
@@ -37,7 +42,11 @@ def extract_go_terms_from_uniprot(
 
     data_buffer = []
     counter = 0
-    found = 0
+    chunk_counter = 0
+
+    go_terms_df = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    go_terms = go_terms_df.get_column("term").unique()
+    go_terms = set(go_terms)
 
     with gzip.open(goa_uniprot_all_gaf_path, "rt") as f:
         for line in tqdm(f, mininterval=1.0, desc="Scanning GAF"):
@@ -57,24 +66,34 @@ def extract_go_terms_from_uniprot(
             if "NOT" in qualifier:
                 continue
 
-            found += 1
-            data_buffer.append({"EntryID": protein_id, "term": go_term, "value": 1.0})
+            if go_term not in go_terms:
+                continue
 
-    logger.debug(
-        f"Found {found}/{counter} ({(found / (counter if counter else 1)) * 100}) % in uniprot"
-    )
+            data_buffer.append({"EntryID": protein_id, "term": go_term, "value": 1.0})
+            if counter % 50_000_000 == 0:
+                df = pl.DataFrame(data_buffer)
+                df.write_csv(Path(DATA_BASE_PATH) / f"{chunk_counter}.csv")
+                chunk_counter += 1
+                del df
+                data_buffer = []
+                gc.collect()
 
     if data_buffer:
         df = pl.DataFrame(data_buffer)
-        df = df.unique()
-    else:
-        df = pl.DataFrame(
-            schema={"EntryID": pl.String, "term": pl.String, "value": pl.Float64}
-        )
+        df.write_csv(Path(DATA_BASE_PATH) / f"{chunk_counter}.csv")
+        chunk_counter += 1
+    chunks = [
+        pl.read_csv(Path(DATA_BASE_PATH) / f"{i}.csv") for i in range(chunk_counter)
+    ]
+    df = pl.concat(chunks)
+    df = df.unique()
+
     if cache:
         if not goa_uniprot_test_preds_path:
             raise ValueError("Path expected if supposed to cache!")
-        df.write_csv(goa_uniprot_test_preds_path)
+        df.write_csv(
+            goa_uniprot_test_preds_path
+        )  # you gotta have enough RAM for this (which I don't so it crased xd)
     return df
 
 

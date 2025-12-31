@@ -5,6 +5,7 @@ MODEL_TO_DIMS: dict[str, int] = {
 }
 
 DATA_BASE_PATH = pathlib.Path(__file__).parent.parent / "data"
+EMBEDDINGS_PATH = DATA_BASE_PATH / "embeddings"
 
 TRAIN_FASTA_PATH = DATA_BASE_PATH / "train/train_sequences.fasta"
 TRAIN_TERMS_PATH = DATA_BASE_PATH / "train/train_terms.tsv"
