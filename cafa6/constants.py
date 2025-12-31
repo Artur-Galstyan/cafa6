@@ -13,6 +13,7 @@ TEST_FASTA_PATH = DATA_BASE_PATH / "test/testsuperset.fasta"
 IA_PATH = DATA_BASE_PATH / "IA.tsv"
 IA_PATH_NO_HEAD = DATA_BASE_PATH / "IA_NO_HEAD.tsv"
 
+TERM_TO_ASPECT_PATH = DATA_BASE_PATH / "term_to_aspect.pkl"
 
 OBO_GRAPH_CHILDREN_PATH = DATA_BASE_PATH / "go_terms_children.npy"
 OBO_GRAPH_PARENTS_PATH = DATA_BASE_PATH / "go_terms_parent.npy"
@@ -21,3 +22,6 @@ GOA_UNIPROT_ALL_GAF_PATH = DATA_BASE_PATH / "goa_uniprot_all.gaf.gz"
 GOA_UNIPROT_TEST_PREDS_PATH = DATA_BASE_PATH / "goa_uniprot_all_test_preds.tsv"
 
 TERM_TO_IDX_LOOKUP_PATH = DATA_BASE_PATH / "term_to_idx_lookup.tsv"
+
+TEST_SUPERSET_TAXON_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-list.tsv"
+TEST_SUPERSET_TAXON_LOOKUP_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-lookup.tsv"

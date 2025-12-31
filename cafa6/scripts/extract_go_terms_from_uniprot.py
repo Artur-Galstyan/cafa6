@@ -76,3 +76,7 @@ def extract_go_terms_from_uniprot(
             raise ValueError("Path expected if supposed to cache!")
         df.write_csv(goa_uniprot_test_preds_path)
     return df
+
+
+if __name__ == "__main__":
+    extract_go_terms_from_uniprot()
