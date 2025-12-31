@@ -4,6 +4,8 @@ MODEL_TO_DIMS: dict[str, int] = {
     "esmc_600m": 1152,
 }
 
+ESM_MODEL = "esmc_600m"
+
 DATA_BASE_PATH = pathlib.Path(__file__).parent.parent / "data"
 EMBEDDINGS_PATH = DATA_BASE_PATH / "embeddings"
 
@@ -27,3 +29,14 @@ TERM_TO_IDX_LOOKUP_PATH = DATA_BASE_PATH / "term_to_idx_lookup.tsv"
 TEST_SUPERSET_TAXON_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-list.tsv"
 TEST_SUPERSET_TAXON_LOOKUP_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-lookup.tsv"
 PARTIAL_SUBMISSION_PATH = DATA_BASE_PATH / "partial_submission.csv"
+PARTIAL_SUBMISSION_FULL_PATH = DATA_BASE_PATH / "partial_submission_full.csv"
+
+TRAIN_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "neighbor_matrix_path_train.npy"
+TEST_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "neighbor_matrix_path_test.npy"
+
+TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH = (
+    DATA_BASE_PATH / "neighbor_matrix_path_train_idx_map.pkl"
+)
+TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH = (
+    DATA_BASE_PATH / "neighbor_matrix_path_test_idx_map.pkl"
+)

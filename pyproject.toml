@@ -8,6 +8,7 @@ dependencies = [
     "beartype>=0.22.9",
     "biopython>=1.86",
     "equinox>=0.13.2",
+    "faiss-cpu>=1.13.2",
     "fire>=0.7.1",
     "grain>=0.2.15",
     "jax[cuda13]>=0.8.2",

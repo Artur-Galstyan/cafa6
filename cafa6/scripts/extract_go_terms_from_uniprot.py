@@ -76,7 +76,9 @@ def extract_go_terms_from_uniprot(
             data_buffer.append({"EntryID": protein_id, "term": go_term, "value": 1.0})
             if counter % 50_000_000 == 0:
                 df = pl.DataFrame(data_buffer)
-                df.write_csv(Path(DATA_BASE_PATH) / f"{chunk_counter}.csv")
+                df.write_csv(
+                    Path(DATA_BASE_PATH) / "gaf_chunks" / f"{chunk_counter}.csv"
+                )
                 chunk_counter += 1
                 del df
                 data_buffer = []
@@ -87,7 +89,8 @@ def extract_go_terms_from_uniprot(
         df.write_csv(Path(DATA_BASE_PATH) / f"{chunk_counter}.csv")
         chunk_counter += 1
     chunks = [
-        pl.read_csv(Path(DATA_BASE_PATH) / f"{i}.csv") for i in range(chunk_counter)
+        pl.read_csv(Path(DATA_BASE_PATH) / "gaf_chunks" / f"{i}.csv")
+        for i in range(chunk_counter)
     ]
     df = pl.concat(chunks)
     df = df.unique()
@@ -113,7 +116,7 @@ def get_existing_go_terms_for_testset(
     chunk_paths = []
     total_chunks = 23  # you get this number if you ran the above function
     for chunk in range(total_chunks):
-        chunk_paths.append(DATA_BASE_PATH / f"{chunk}.csv")
+        chunk_paths.append(DATA_BASE_PATH / "gaf_chunks" / f"{chunk}.csv")
 
     lazy_df = pl.scan_csv(chunk_paths)
     protein_ids_list = list(protein_ids_set)
