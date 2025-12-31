@@ -1,3 +1,4 @@
+import pickle
 import random
 import re
 from pathlib import Path
@@ -7,10 +8,22 @@ import numpy as np
 import polars as pl
 from beartype.typing import Literal, SupportsIndex
 from Bio import SeqIO
+from grain import DataLoader
+from grain.samplers import IndexSampler
+from grain.sharding import ShardOptions
 from grain.sources import RandomAccessDataSource
-from grain.transforms import Map
+from grain.transforms import Batch, Map
 
-from cafa6.constants import EMBEDDINGS_PATH, MODEL_TO_DIMS
+from cafa6.constants import (
+    EMBEDDINGS_PATH,
+    ESM_MODEL,
+    IA_PATH,
+    MODEL_TO_DIMS,
+    TRAIN_FASTA_PATH,
+    TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH,
+    TRAIN_NEIGHBOR_MATRIX_PATH,
+    TRAIN_TERMS_PATH,
+)
 
 _SHARED_PRIORS = None
 
@@ -67,7 +80,9 @@ class DataSource(RandomAccessDataSource):
         )
 
 
-def get_datasources(train_fasta_path, train_terms_path, ratio=0.1):
+def get_datasources(
+    train_fasta_path=TRAIN_FASTA_PATH, train_terms_path=TRAIN_TERMS_PATH, ratio=0.1
+):
     n_total = 0
     for record in SeqIO.parse(train_fasta_path, "fasta"):
         n_total += 1
@@ -95,7 +110,7 @@ class MapTermsToArrayAndEmbeddings(Map):
         self,
         terms_to_idx_weight: dict,
         neighbor_priors_path: str,
-        protein_ids_path: str,
+        neighbor_priors_idx_map_path: str,
         esm_model: str,
         max_protein_seq: int = 1024,
         esm_strategy: Literal["mean", "raw"] = "mean",
@@ -104,8 +119,11 @@ class MapTermsToArrayAndEmbeddings(Map):
         self.terms_to_idx_weight = terms_to_idx_weight
 
         self.neighbor_priors_path = neighbor_priors_path
-        protein_ids = np.load(protein_ids_path)
-        self.pid_to_prior_idx = {pid: i for i, pid in enumerate(protein_ids)}
+        self.neighbor_priors_idx_map_path = neighbor_priors_idx_map_path
+
+        with open(neighbor_priors_idx_map_path, "rb") as f:
+            self.pid_to_prior_idx = pickle.load(f)
+
         self.embedding_base_path = Path(embedding_base_path)
         self.esm_model = esm_model
         self.max_protein_seq = max_protein_seq
@@ -156,3 +174,52 @@ class MapTermsToArrayAndEmbeddings(Map):
             neighbor_prior = np.zeros(len(self.terms_to_idx_weight), dtype=np.float32)
 
         return protein_id, embeddings_esm, neighbor_prior, taxon, mask, labels
+
+
+def get_dataloaders(batch_size: int, num_epochs: int, worker_count: int):
+    terms_to_idx_weight = {}
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    for i, row in enumerate(ia_df.iter_rows(named=True)):
+        terms_to_idx_weight[row["term"]] = (i, row["weight"])
+
+    transformations = [
+        MapTermsToArrayAndEmbeddings(
+            terms_to_idx_weight,
+            str(TRAIN_NEIGHBOR_MATRIX_PATH),
+            str(TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH),
+            ESM_MODEL,
+        ),
+        Batch(batch_size=batch_size),
+    ]
+
+    train_data_source, val_data_source = get_datasources()
+
+    train_sampler = IndexSampler(
+        num_records=len(train_data_source),
+        num_epochs=num_epochs,
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
+        shuffle=True,
+        seed=42,
+    )
+    train_loader = DataLoader(
+        data_source=train_data_source,
+        operations=transformations,
+        sampler=train_sampler,
+        worker_count=worker_count,
+    )
+
+    val_sampler = IndexSampler(
+        num_records=len(val_data_source),
+        num_epochs=num_epochs,
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
+        shuffle=True,
+        seed=42,
+    )
+    val_loader = DataLoader(
+        data_source=val_data_source,
+        operations=transformations,
+        sampler=val_sampler,
+        worker_count=0,
+    )
+
+    return train_loader, val_loader
