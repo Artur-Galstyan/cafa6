@@ -19,6 +19,7 @@ from cafa6.constants import (
     ESM_MODEL,
     IA_PATH,
     MODEL_TO_DIMS,
+    TEST_SUPERSET_TAXON_LOOKUP_PATH,
     TRAIN_FASTA_PATH,
     TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH,
     TRAIN_NEIGHBOR_MATRIX_PATH,
@@ -115,14 +116,21 @@ class MapTermsToArrayAndEmbeddings(Map):
         max_protein_seq: int = 1024,
         esm_strategy: Literal["mean", "raw"] = "mean",
         embedding_base_path: str | Path = EMBEDDINGS_PATH,
+        taxon_lookup_path: str | Path = TEST_SUPERSET_TAXON_LOOKUP_PATH,
     ):
         self.terms_to_idx_weight = terms_to_idx_weight
 
         self.neighbor_priors_path = neighbor_priors_path
         self.neighbor_priors_idx_map_path = neighbor_priors_idx_map_path
+        self.taxon_lookup_path = taxon_lookup_path
 
         with open(neighbor_priors_idx_map_path, "rb") as f:
             self.pid_to_prior_idx = pickle.load(f)
+
+        self.taxon_to_idx = {}
+        taxon_idx_df = pl.read_csv(self.taxon_lookup_path)
+        for row in taxon_idx_df.iter_rows(named=True):
+            self.taxon_to_idx[row["ID"]] = row["idx"]
 
         self.embedding_base_path = Path(embedding_base_path)
         self.esm_model = esm_model
@@ -135,7 +143,6 @@ class MapTermsToArrayAndEmbeddings(Map):
             _SHARED_PRIORS = np.load(self.neighbor_priors_path, mmap_mode="r")
 
         protein_id, sequence, terms, taxon = element
-        taxon = np.array(taxon)
         indices = np.array([self.terms_to_idx_weight[t][0] for t in terms])
 
         labels = np.zeros(len(self.terms_to_idx_weight), dtype=np.float32)
@@ -173,10 +180,17 @@ class MapTermsToArrayAndEmbeddings(Map):
         else:
             neighbor_prior = np.zeros(len(self.terms_to_idx_weight), dtype=np.float32)
 
-        return protein_id, embeddings_esm, neighbor_prior, taxon, mask, labels
+        return (
+            protein_id,
+            embeddings_esm,
+            neighbor_prior,
+            self.taxon_to_idx[taxon],
+            mask,
+            labels,
+        )
 
 
-def get_dataloaders(batch_size: int, num_epochs: int, worker_count: int):
+def get_dataloaders(batch_size: int = 128, num_epochs: int = 8, worker_count: int = 0):
     terms_to_idx_weight = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
     for i, row in enumerate(ia_df.iter_rows(named=True)):
@@ -223,3 +237,13 @@ def get_dataloaders(batch_size: int, num_epochs: int, worker_count: int):
     )
 
     return train_loader, val_loader
+
+
+if __name__ == "__main__":
+    train_loader, _ = get_dataloaders(batch_size=1)
+
+    for d in train_loader:
+        protein_id, embeddings_esm, neighbor_prior, taxon, mask, labels = d
+        print(f"{taxon=}")
+        print(f"{mask.shape=}")
+        break

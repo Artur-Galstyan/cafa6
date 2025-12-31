@@ -102,3 +102,45 @@ def evaluate(preds: Array, labels: Array) -> Array:
         return (f1_mf + f1_bp + f1_cc) / 3
 
     return _eval()
+
+
+def eval(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
+    all_preds = []
+    all_labels = []
+
+    inference_model = eqx.nn.inference_mode(model)
+
+    cond_array = jnp.array([condition_val])
+
+    @eqx.filter_jit
+    def _get_preds(_model, _e, _n, _t, _m, _c):
+        logits = eqx.filter_vmap(_model, in_axes=(0, 0, 0, 0, None, None))(
+            _e, _n, _t, _m, _c, None
+        )
+        preds = jax.nn.sigmoid(logits)
+        return preds
+
+    for batch in val_data_loader:
+        idx, esm_emb, neighbor_prior, taxon, mask, y = batch
+        esm_emb, neighbor_prior, taxon, mask, y = (
+            jnp.array(esm_emb),
+            jnp.array(neighbor_prior),
+            jnp.array(taxon),
+            jnp.array(mask),
+            jnp.array(y),
+        )
+
+        preds = _get_preds(
+            inference_model, esm_emb, neighbor_prior, taxon, mask, cond_array
+        )
+
+        all_preds.append(preds)
+        all_labels.append(y)
+
+    all_preds = jnp.concatenate(all_preds, axis=0)
+    all_labels = jnp.concatenate(all_labels, axis=0)
+
+    return evaluate(
+        all_preds,
+        all_labels,
+    )
