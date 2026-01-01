@@ -1,6 +1,9 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+import json
+
+import coolname
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -60,7 +63,7 @@ class TrainConfig(BaseModel):
     esm_model_depth: int = 3
 
     warmup_steps: int = 500
-    ratio: float = 0.15
+    ratio: float = 0.2
 
 
 def _setup_mlflow():
@@ -151,8 +154,11 @@ def step_fn(
     return model, opt_state, value
 
 
-def train(train_config: TrainConfig = TrainConfig()):
+def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = None):
     _setup_mlflow()
+    if model_name is None:
+        model_name = coolname.generate_slug(3)
+    assert model_name is not None
     n_terms = len(pl.read_csv(TERM_TO_IDX_LOOKUP_PATH))
     terms_to_idx_weight: dict[str, tuple[int, float]] = {}
     idx_to_terms_weight: dict[int, tuple[str, float]] = {}
@@ -166,19 +172,21 @@ def train(train_config: TrainConfig = TrainConfig()):
     go_term_weights = np.array(
         [w for _, (_, w) in sorted(terms_to_idx_weight.items(), key=lambda x: x[1][0])]
     )
-
+    model_config = {
+        "n_terms": n_terms,
+        "embedding_size": train_config.deepgo_se_embedding_size,
+        "esm_embedding_size": MODEL_TO_DIMS[ESM_MODEL],
+        "esm_proj_width_size": train_config.esm_proj_width_size,
+        "esm_proj_depth": train_config.esm_proj_depth,
+        "taxa_embedding_size": train_config.taxa_embedding_size,
+        "taxa_vocab_size": train_config.taxa_vocab_size,
+        "taxa_mlp_depth": train_config.taxa_mlp_depth,
+        "taxa_mlp_width": train_config.taxa_mlp_width,
+        "esm_model_width_size": train_config.esm_model_width_size,
+        "esm_model_depth": train_config.esm_model_depth,
+    }
     model = Model(
-        n_terms=n_terms,
-        embedding_size=train_config.deepgo_se_embedding_size,
-        esm_embedding_size=MODEL_TO_DIMS[ESM_MODEL],
-        esm_proj_width_size=train_config.esm_proj_width_size,
-        esm_proj_depth=train_config.esm_proj_depth,
-        taxa_embedding_size=train_config.taxa_embedding_size,
-        taxa_vocab_size=train_config.taxa_vocab_size,
-        taxa_mlp_depth=train_config.taxa_mlp_depth,
-        taxa_mlp_width=train_config.taxa_mlp_width,
-        esm_model_width_size=train_config.esm_model_width_size,
-        esm_model_depth=train_config.esm_model_depth,
+        **model_config,
         key=jax.random.key(0),
     )
 
@@ -214,7 +222,7 @@ def train(train_config: TrainConfig = TrainConfig()):
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     key = jax.random.key(1)
 
-    with mlflow.start_run():
+    with mlflow.start_run(description=model_name):
         mlflow.log_params(train_config.model_dump())
 
         best_score = 0.0
@@ -281,7 +289,10 @@ def train(train_config: TrainConfig = TrainConfig()):
                         print(f"Early stopping at epoch {epoch}")
                         break
 
-    eqx.tree_serialise_leaves(WEIGHTS_BASE_PATH / "best-model.eqx", best_model)
+    eqx.tree_serialise_leaves(WEIGHTS_BASE_PATH / f"{model_name}.eqx", best_model)
+
+    with open(WEIGHTS_BASE_PATH / f"{model_name}-config.json", "w") as f:
+        json.dump(model_config, f)
 
     return model
 

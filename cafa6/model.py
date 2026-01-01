@@ -5,6 +5,10 @@ from jaxtyping import Array, Float, Int, PRNGKeyArray
 
 
 class AttentionPooling(eqx.Module):
+    """
+    Unused; Mean-Pooling works good enough
+    """
+
     layer: eqx.nn.Linear
 
     def __init__(self, in_size: int, key: PRNGKeyArray):
