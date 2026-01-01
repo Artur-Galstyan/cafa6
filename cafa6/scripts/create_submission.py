@@ -94,6 +94,7 @@ def create_submission(
     new_preds = current_preds.join(
         partial_submission, on=["EntryID", "term"], how="anti"
     )
+    new_preds = new_preds.cast({"value": pl.Float64})
 
     final_submission = new_preds.vstack(partial_submission)
     final_submission = cast(pl.DataFrame, final_submission)
