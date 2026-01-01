@@ -202,7 +202,6 @@ class Model(eqx.Module):
         condition: Float[Array, "1"],
         key: PRNGKeyArray | None = None,
     ):
-        print("JIT MODEL")
         esm_emb = self.dropout(esm_emb, key=key)
         # esm_emb = self.attn_pool(esm_emb, mask)
         cond_emb = self.condition_mlp(condition)

@@ -1,5 +1,6 @@
 import os
 
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -19,7 +20,12 @@ from cafa6.constants import (
     TERM_TO_IDX_LOOKUP_PATH,
     WEIGHTS_BASE_PATH,
 )
-from cafa6.data import get_dataloaders
+from cafa6.data import (
+    create_train_loader,
+    create_val_loader,
+    get_datasources,
+    get_transformations,
+)
 from cafa6.eval import evaluate
 from cafa6.model import Model
 from cafa6.utils import get_graph_edges
@@ -176,8 +182,14 @@ def train(train_config: TrainConfig = TrainConfig()):
         key=jax.random.key(0),
     )
 
-    train_data_loader, validation_data_loader, n_total = get_dataloaders(
-        train_config.batch_size, train_config.num_epochs, train_config.worker_count
+    transformations = get_transformations(train_config.batch_size)
+    train_data_source, val_data_source, n_total = get_datasources()
+    train_data_loader = create_train_loader(
+        train_data_source,
+        transformations,
+        train_config.batch_size,
+        train_config.num_epochs,
+        train_config.worker_count,
     )
     best_model = model
     children, parents = get_graph_edges(terms_to_idx)
@@ -248,7 +260,8 @@ def train(train_config: TrainConfig = TrainConfig()):
                 avg_loss = epoch_loss / steps_per_epoch
                 epoch_loss = 0.0
 
-                val_iterator = iter(validation_data_loader)
+                val_loader = create_val_loader(val_data_source, transformations)
+                val_iterator = iter(val_loader)
                 score = evaluate(model, val_iterator)
 
                 mlflow.log_metric("validation_score", score, step=step)

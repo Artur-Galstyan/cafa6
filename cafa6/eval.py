@@ -82,26 +82,26 @@ def max_f1_masked(preds: Array, labels: Array, weights: Array, mask: Array) -> A
     return jnp.max(f1s)
 
 
-def _evaluate(preds: Array, labels: Array) -> Array:
-    weights = jnp.array(get_go_term_weights())
-    term_to_aspect = build_term_to_aspect()
-    if not TERM_TO_IDX_LOOKUP_PATH.exists():
-        raise FileNotFoundError(
-            f"{TERM_TO_IDX_LOOKUP_PATH} not found. Run scripts/cafa6_terms_to_idx.py"
-        )
-    term_to_idx_weight = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
-    term_to_idx = dict(zip(term_to_idx_weight["term"], term_to_idx_weight["index"]))
-    aspect_masks = build_aspect_masks(term_to_idx, term_to_aspect)
+@eqx.filter_jit
+def _evaluate_scores(
+    preds: Array, labels: Array, weights: Array, aspect_masks: dict[str, Array]
+) -> Array:
+    print("_evaluate_scores JIT")
+    f1_mf = max_f1_masked(preds, labels, weights, aspect_masks["F"])
+    f1_bp = max_f1_masked(preds, labels, weights, aspect_masks["P"])
+    f1_cc = max_f1_masked(preds, labels, weights, aspect_masks["C"])
 
-    @eqx.filter_jit
-    def _eval():
-        f1_mf = max_f1_masked(preds, labels, weights, aspect_masks["F"])
-        f1_bp = max_f1_masked(preds, labels, weights, aspect_masks["P"])
-        f1_cc = max_f1_masked(preds, labels, weights, aspect_masks["C"])
+    return (f1_mf + f1_bp + f1_cc) / 3
 
-        return (f1_mf + f1_bp + f1_cc) / 3
 
-    return _eval()
+@eqx.filter_jit
+def _get_preds(_model, _e, _n, _t, _m, _c):
+    print("_get_preds JIT")
+    logits = eqx.filter_vmap(_model, in_axes=(0, 0, 0, 0, None, None))(
+        _e, _n, _t, _m, _c, None
+    )
+    preds = jax.nn.sigmoid(logits)
+    return preds
 
 
 def evaluate(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
@@ -111,14 +111,6 @@ def evaluate(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
     inference_model = eqx.nn.inference_mode(model)
 
     cond_array = jnp.array([condition_val])
-
-    @eqx.filter_jit
-    def _get_preds(_model, _e, _n, _t, _m, _c):
-        logits = eqx.filter_vmap(_model, in_axes=(0, 0, 0, 0, None, None))(
-            _e, _n, _t, _m, _c, None
-        )
-        preds = jax.nn.sigmoid(logits)
-        return preds
 
     for batch in val_data_loader:
         idx, esm_emb, neighbor_prior, taxon, mask, y = batch
@@ -140,7 +132,14 @@ def evaluate(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
     all_preds = jnp.concatenate(all_preds, axis=0)
     all_labels = jnp.concatenate(all_labels, axis=0)
 
-    return _evaluate(
-        all_preds,
-        all_labels,
-    )
+    weights = jnp.array(get_go_term_weights())
+    term_to_aspect = build_term_to_aspect()
+    if not TERM_TO_IDX_LOOKUP_PATH.exists():
+        raise FileNotFoundError(
+            f"{TERM_TO_IDX_LOOKUP_PATH} not found. Run scripts/cafa6_terms_to_idx.py"
+        )
+    term_to_idx_weight = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    term_to_idx = dict(zip(term_to_idx_weight["term"], term_to_idx_weight["index"]))
+    aspect_masks = build_aspect_masks(term_to_idx, term_to_aspect)
+
+    return _evaluate_scores(all_preds, all_labels, weights, aspect_masks)

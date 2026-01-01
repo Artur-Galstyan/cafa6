@@ -190,7 +190,8 @@ class MapTermsToArrayAndEmbeddings(Map):
         )
 
 
-def get_dataloaders(batch_size: int = 128, num_epochs: int = 8, worker_count: int = 0):
+def get_transformations(batch_size: int = 128):
+    """Get the data transformations for training/validation."""
     terms_to_idx_weight = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
     for i, row in enumerate(ia_df.iter_rows(named=True)):
@@ -203,11 +204,18 @@ def get_dataloaders(batch_size: int = 128, num_epochs: int = 8, worker_count: in
             str(TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH),
             ESM_MODEL,
         ),
-        Batch(batch_size=batch_size),
+        Batch(batch_size=batch_size, drop_remainder=True),
     ]
+    return transformations
 
-    train_data_source, val_data_source, n_total = get_datasources()
 
+def create_train_loader(
+    train_data_source,
+    transformations,
+    batch_size: int = 128,
+    num_epochs: int = 8,
+    worker_count: int = 0,
+):
     train_sampler = IndexSampler(
         num_records=len(train_data_source),
         num_epochs=num_epochs,
@@ -215,25 +223,25 @@ def get_dataloaders(batch_size: int = 128, num_epochs: int = 8, worker_count: in
         shuffle=True,
         seed=42,
     )
-    train_loader = DataLoader(
+    return DataLoader(
         data_source=train_data_source,
         operations=transformations,
         sampler=train_sampler,
         worker_count=worker_count,
     )
 
+
+def create_val_loader(val_data_source, transformations):
     val_sampler = IndexSampler(
         num_records=len(val_data_source),
-        num_epochs=num_epochs,
+        num_epochs=1,
         shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
-        shuffle=True,
-        seed=42,
+        shuffle=False,
+        seed=0,
     )
-    val_loader = DataLoader(
+    return DataLoader(
         data_source=val_data_source,
         operations=transformations,
         sampler=val_sampler,
         worker_count=0,
     )
-
-    return train_loader, val_loader, n_total

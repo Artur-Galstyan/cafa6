@@ -60,5 +60,5 @@ def get_go_term_weights(
         )
     df = pl.read_csv(term_to_idx_lookup_path)
     col = df.select(pl.col("weight"))
-    col = np.array(col)
+    col = np.array(col).reshape(-1)
     return col
