@@ -35,7 +35,7 @@ from cafa6.utils import get_graph_edges
 
 
 class TrainConfig(BaseModel):
-    batch_size: int = 128
+    batch_size: int = 256
     learning_rate: float = 0.0005
     num_epochs: int = 100
     worker_count: int = 4
@@ -47,20 +47,18 @@ class TrainConfig(BaseModel):
     esm_model: str = "esmc_600m"
     esm_strategy: Literal["raw", "mean"] = "mean"
 
-    pos_weight: float = 20.0
-
     deepgo_se_embedding_size: int = 1024
 
-    esm_proj_width_size: int = 1024
-    esm_proj_depth: int = 4
+    esm_proj_width_size: int = 2048
+    esm_proj_depth: int = 2
 
-    taxa_embedding_size: int = 512
+    taxa_embedding_size: int = 1024
     taxa_vocab_size: int = 8500
-    taxa_mlp_depth: int = 3
-    taxa_mlp_width: int = 512
+    taxa_mlp_depth: int = 2
+    taxa_mlp_width: int = 1024
 
-    esm_model_width_size: int = 1024
-    esm_model_depth: int = 3
+    esm_model_width_size: int = 2048
+    esm_model_depth: int = 2
 
     warmup_steps: int = 500
     ratio: float = 0.2
@@ -94,6 +92,25 @@ def axiom_loss(
     return jnp.mean(jax.nn.relu(axiom_loss))
 
 
+def focal_weight(probs, labels, gamma=2.0):
+    p_t = labels * probs + (1 - labels) * (1 - probs)
+    focal_weight = (1 - p_t) ** gamma
+
+    return focal_weight
+
+
+# def hierarchy_consistency_loss(probs, ontology_graph):
+#     child_idx = ontology_graph[:, 0]
+#     parent_idx = ontology_graph[:, 1]
+
+#     child_probs = probs[:, child_idx]
+#     parent_probs = probs[:, parent_idx]
+
+#     # Child should never be > parent
+#     violation = jax.nn.relu(child_probs - parent_probs)
+#     return violation.mean()
+
+
 def loss_fn(
     model: PyTree,
     X: tuple[Array, ...],
@@ -106,12 +123,11 @@ def loss_fn(
     esm_emb, neighbor_prior, taxa, mask = X
     keys = jax.random.split(key, len(labels))
     logits = eqx.filter_vmap(model)(*X, sampled_weight, keys)
+    probs = jax.nn.sigmoid(logits)
 
     smoothing = 0.05
     soft_labels = labels * (1.0 - smoothing) + 0.5 * smoothing
     per_term_loss = optax.sigmoid_binary_cross_entropy(logits, soft_labels)
-
-    # per_term_loss = optax.sigmoid_binary_cross_entropy(logits, labels)
 
     weight_multiplier = 1.0 + (labels * (sampled_weight - 1.0))
     weighted_loss = per_term_loss * weight_multiplier * go_term_weight
@@ -124,7 +140,9 @@ def loss_fn(
         ontology_graph,
     )
 
-    return base_loss + axiom_loss_value
+    focal_loss = focal_weight(probs, labels) * per_term_loss
+
+    return base_loss + axiom_loss_value + jnp.mean(focal_loss)
 
 
 @eqx.filter_jit
@@ -159,6 +177,8 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     if model_name is None:
         model_name = coolname.generate_slug(3)
     assert model_name is not None
+    print("Training model with name:")
+    print(model_name)
     n_terms = len(pl.read_csv(TERM_TO_IDX_LOOKUP_PATH))
     terms_to_idx_weight: dict[str, tuple[int, float]] = {}
     idx_to_terms_weight: dict[int, tuple[str, float]] = {}

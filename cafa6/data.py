@@ -23,9 +23,12 @@ from cafa6.constants import (
     TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH,
     TEST_NEIGHBOR_MATRIX_PATH,
     TEST_SUPERSET_TAXON_LOOKUP_PATH,
+    TRAIN_FASTA_EXTENDED_CORRECTED_PATH,
+    TRAIN_FASTA_EXTENDED_PATH,
     TRAIN_FASTA_PATH,
     TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH,
     TRAIN_NEIGHBOR_MATRIX_PATH,
+    TRAIN_TERMS_EXTENDED_PATH,
     TRAIN_TERMS_PATH,
 )
 
@@ -125,7 +128,7 @@ class DataSource(RandomAccessDataSource):
 
         for record in SeqIO.parse(train_fasta_path, "fasta"):
             all_sequences.append(str(record.seq))
-            protein_id = record.id.split("|")[1]
+            protein_id = record.id if "|" not in record.id else record.id.split("|")[1]
             description = record.description
             taxon = int(re.search(r"(?<=OX=)\d+", description).group(0))  # ty:ignore[possibly-missing-attribute]
 
@@ -231,19 +234,30 @@ class TestMapToArrayAndEmbeddings(Map):
 
 
 def get_datasources(
-    train_fasta_path=TRAIN_FASTA_PATH, train_terms_path=TRAIN_TERMS_PATH, ratio=0.1
+    train_fasta_path=TRAIN_FASTA_EXTENDED_CORRECTED_PATH,
+    train_terms_path=TRAIN_TERMS_EXTENDED_PATH,
+    original_fasta_path=TRAIN_FASTA_PATH,
+    ratio=0.1,
 ):
-    n_total = 0
+    original_ids = set()
+    for record in SeqIO.parse(original_fasta_path, "fasta"):
+        pid = record.id.split("|")[1] if "|" in record.id else record.id
+        original_ids.add(pid)
+
+    all_proteins = []
     for record in SeqIO.parse(train_fasta_path, "fasta"):
-        n_total += 1
+        pid = record.id.split("|")[1] if "|" in record.id else record.id
+        all_proteins.append(pid)
 
-    all_indices = list(range(n_total))
+    original_indices = [i for i, pid in enumerate(all_proteins) if pid in original_ids]
+    new_indices = [i for i, pid in enumerate(all_proteins) if pid not in original_ids]
+
     random.seed(42)
-    random.shuffle(all_indices)
+    random.shuffle(original_indices)
+    val_size = int(len(original_indices) * ratio)
+    val_indices = original_indices[:val_size]
 
-    val_size = int(n_total * ratio)
-    val_indices = all_indices[:val_size]
-    train_indices = all_indices[val_size:]
+    train_indices = original_indices[val_size:] + new_indices
 
     train_data_source = DataSource(
         str(train_fasta_path), str(train_terms_path), train_indices
@@ -252,7 +266,7 @@ def get_datasources(
         str(train_fasta_path), str(train_terms_path), val_indices
     )
 
-    return train_data_source, val_data_source, n_total
+    return train_data_source, val_data_source, len(train_indices)
 
 
 class MapTermsToArrayAndEmbeddings(Map):

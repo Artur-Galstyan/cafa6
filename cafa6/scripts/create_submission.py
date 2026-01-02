@@ -103,7 +103,7 @@ def create_submission(
 
 
 if __name__ == "__main__":
-    model_name = "ingenious-gleaming-chamois"
+    model_name = "wealthy-lovely-firefly"
     model_path = WEIGHTS_BASE_PATH / f"{model_name}.eqx"
     model_config_path = WEIGHTS_BASE_PATH / f"{model_name}-config.json"
     create_submission(

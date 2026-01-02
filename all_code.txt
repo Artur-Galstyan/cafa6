@@ -1,0 +1,1885 @@
+import os
+
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+import json
+
+import coolname
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import mlflow
+import numpy as np
+import optax
+import polars as pl
+from beartype.typing import Literal
+from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
+from pydantic import BaseModel
+from tqdm import tqdm
+
+from cafa6.constants import (
+    ESM_MODEL,
+    IA_PATH,
+    MODEL_TO_DIMS,
+    TERM_TO_IDX_LOOKUP_PATH,
+    WEIGHTS_BASE_PATH,
+)
+from cafa6.data import (
+    create_train_loader,
+    create_val_loader,
+    get_datasources,
+    get_transformations,
+)
+from cafa6.eval import evaluate
+from cafa6.model import Model
+from cafa6.utils import get_graph_edges
+
+
+class TrainConfig(BaseModel):
+    batch_size: int = 256
+    learning_rate: float = 0.0005
+    num_epochs: int = 100
+    worker_count: int = 4
+    patience: int = 10
+
+    knn: int = 6
+    max_protein_seq: int = 1024
+
+    esm_model: str = "esmc_600m"
+    esm_strategy: Literal["raw", "mean"] = "mean"
+
+    deepgo_se_embedding_size: int = 1024
+
+    esm_proj_width_size: int = 2048
+    esm_proj_depth: int = 2
+
+    taxa_embedding_size: int = 1024
+    taxa_vocab_size: int = 8500
+    taxa_mlp_depth: int = 2
+    taxa_mlp_width: int = 1024
+
+    esm_model_width_size: int = 2048
+    esm_model_depth: int = 2
+
+    warmup_steps: int = 500
+    ratio: float = 0.2
+
+
+def _setup_mlflow():
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+    assert tracking_uri is not None
+
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment("Cafa6")
+
+
+def axiom_loss(
+    terms_emb: Float[Array, "n_terms emb_size"],
+    terms_radii: Float[Array, "n_terms"],
+    ontology_graph: Int[Array, "n_edges 2"],
+    margin: float = 0.05,
+):
+    child_idx = ontology_graph[:, 0]
+    parent_idx = ontology_graph[:, 1]
+
+    c_B, r_B = terms_emb[child_idx], terms_radii[child_idx]
+    r_B = r_B.reshape(-1, 1)
+    c_A, r_A = terms_emb[parent_idx], terms_radii[parent_idx]
+    r_A = r_A.reshape(-1, 1)
+
+    center_distance = jnp.linalg.norm(c_B - c_A, axis=1, keepdims=True)
+    axiom_loss = center_distance + r_B - r_A + margin
+
+    return jnp.mean(jax.nn.relu(axiom_loss))
+
+
+def loss_fn(
+    model: PyTree,
+    X: tuple[Array, ...],
+    labels: Int[Array, "batch_size n_terms"],
+    sampled_weight: float,
+    go_term_weight: Array,
+    ontology_graph: Int[Array, "n_edges 2"],
+    key: PRNGKeyArray,
+):
+    esm_emb, neighbor_prior, taxa, mask = X
+    keys = jax.random.split(key, len(labels))
+    logits = eqx.filter_vmap(model)(*X, sampled_weight, keys)
+
+    smoothing = 0.05
+    soft_labels = labels * (1.0 - smoothing) + 0.5 * smoothing
+    per_term_loss = optax.sigmoid_binary_cross_entropy(logits, soft_labels)
+
+    # per_term_loss = optax.sigmoid_binary_cross_entropy(logits, labels)
+
+    weight_multiplier = 1.0 + (labels * (sampled_weight - 1.0))
+    weighted_loss = per_term_loss * weight_multiplier * go_term_weight
+
+    base_loss = jnp.mean(weighted_loss)
+
+    axiom_loss_value = axiom_loss(
+        model.deepgo.term_centers.weight,
+        model.deepgo.term_radii,
+        ontology_graph,
+    )
+
+    return base_loss + axiom_loss_value
+
+
+@eqx.filter_jit
+def step_fn(
+    model: PyTree,
+    X: tuple[Array, ...],
+    y: Array,
+    optimizer: optax.GradientTransformation,
+    opt_state: optax.OptState,
+    ontology_graph: Int[Array, "n_terms 2"],
+    go_term_weights: Array,
+    key: PRNGKeyArray,
+):
+    key, cond_key = jax.random.split(key)
+    batch_size, *_ = y.shape
+    sampled_weight = jax.random.uniform(
+        cond_key, shape=(batch_size, 1), minval=5.0, maxval=50.0
+    )
+    value, grads = eqx.filter_value_and_grad(loss_fn)(
+        model, X, y, sampled_weight, go_term_weights, ontology_graph, key
+    )
+    updates, opt_state = optimizer.update(
+        grads, opt_state, eqx.filter(model, eqx.is_array)
+    )
+
+    model = eqx.apply_updates(model, updates)
+    return model, opt_state, value
+
+
+def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = None):
+    _setup_mlflow()
+    if model_name is None:
+        model_name = coolname.generate_slug(3)
+    assert model_name is not None
+    n_terms = len(pl.read_csv(TERM_TO_IDX_LOOKUP_PATH))
+    terms_to_idx_weight: dict[str, tuple[int, float]] = {}
+    idx_to_terms_weight: dict[int, tuple[str, float]] = {}
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    for i, row in enumerate(ia_df.iter_rows(named=True)):
+        terms_to_idx_weight[row["term"]] = (i, row["weight"])
+        idx_to_terms_weight[i] = (row["term"], row["weight"])
+
+    terms_to_idx = {t: idx for t, (idx, _) in terms_to_idx_weight.items()}
+
+    go_term_weights = np.array(
+        [w for _, (_, w) in sorted(terms_to_idx_weight.items(), key=lambda x: x[1][0])]
+    )
+    model_config = {
+        "n_terms": n_terms,
+        "embedding_size": train_config.deepgo_se_embedding_size,
+        "esm_embedding_size": MODEL_TO_DIMS[ESM_MODEL],
+        "esm_proj_width_size": train_config.esm_proj_width_size,
+        "esm_proj_depth": train_config.esm_proj_depth,
+        "taxa_embedding_size": train_config.taxa_embedding_size,
+        "taxa_vocab_size": train_config.taxa_vocab_size,
+        "taxa_mlp_depth": train_config.taxa_mlp_depth,
+        "taxa_mlp_width": train_config.taxa_mlp_width,
+        "esm_model_width_size": train_config.esm_model_width_size,
+        "esm_model_depth": train_config.esm_model_depth,
+    }
+    model = Model(
+        **model_config,
+        key=jax.random.key(0),
+    )
+
+    transformations = get_transformations(train_config.batch_size)
+    train_data_source, val_data_source, n_total = get_datasources()
+    train_data_loader = create_train_loader(
+        train_data_source,
+        transformations,
+        train_config.batch_size,
+        train_config.num_epochs,
+        train_config.worker_count,
+    )
+    best_model = model
+    children, parents = get_graph_edges(terms_to_idx)
+    ontology_graph = jnp.vstack((children, parents)).T
+
+    total_steps = (n_total // train_config.batch_size) * train_config.num_epochs
+
+    scheduler = optax.warmup_cosine_decay_schedule(
+        init_value=1e-5,
+        peak_value=train_config.learning_rate,
+        warmup_steps=train_config.warmup_steps,
+        decay_steps=total_steps,
+        end_value=1e-6,
+    )
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=scheduler),
+    )
+
+    # optimizer = optax.MultiSteps(optimizer, every_k_schedule=16)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    key = jax.random.key(1)
+
+    with mlflow.start_run(description=model_name):
+        mlflow.log_params(train_config.model_dump())
+
+        best_score = 0.0
+        no_improve = 0
+        epoch = 0
+        epoch_loss = 0.0
+
+        steps_per_epoch = (
+            int(n_total * (1 - train_config.ratio)) // train_config.batch_size
+        )
+        total_steps = steps_per_epoch * train_config.num_epochs
+
+        for step, batch in tqdm(
+            enumerate(train_data_loader),
+            total=(n_total * (1 - train_config.ratio)) // train_config.batch_size,
+        ):
+            key, subkey = jax.random.split(key)
+            idx, esm_emb, neighbor_prior, taxon, mask, y = batch
+            esm_emb, neighbor_prior, taxon, mask, y = (
+                jnp.array(esm_emb),
+                jnp.array(neighbor_prior),
+                jnp.array(taxon),
+                jnp.array(mask),
+                jnp.array(y),
+            )
+
+            model, opt_state, loss = step_fn(
+                model,
+                (esm_emb, neighbor_prior, taxon, mask),
+                y,
+                optimizer,
+                opt_state,
+                ontology_graph,
+                go_term_weights,
+                subkey,
+            )
+            curr_loss = float(loss)
+            mlflow.log_metric("train_loss", curr_loss, step=step)
+            epoch_loss += curr_loss
+
+            if (step + 1) % steps_per_epoch == 0:
+                epoch += 1
+                avg_loss = epoch_loss / steps_per_epoch
+                epoch_loss = 0.0
+
+                val_loader = create_val_loader(val_data_source, transformations)
+                val_iterator = iter(val_loader)
+                score = evaluate(model, val_iterator)
+
+                mlflow.log_metric("validation_score", score, step=step)
+                mlflow.log_metric("epoch_avg_loss", avg_loss, step=step)
+
+                print(
+                    f"Epoch {epoch} | Val score: {score:.4f} | Avg Loss: {avg_loss:.4f}"
+                )
+
+                if score > best_score:
+                    best_score = score
+                    no_improve = 0
+                    best_model = model
+                else:
+                    no_improve += 1
+                    if no_improve >= train_config.patience:
+                        print(f"Early stopping at epoch {epoch}")
+                        break
+
+    eqx.tree_serialise_leaves(WEIGHTS_BASE_PATH / f"{model_name}.eqx", best_model)
+
+    with open(WEIGHTS_BASE_PATH / f"{model_name}-config.json", "w") as f:
+        json.dump(model_config, f)
+
+    return model
+
+
+if __name__ == "__main__":
+    train()
+import pickle
+from pathlib import Path
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import polars as pl
+from jaxtyping import Array
+
+from cafa6.constants import (
+    TERM_TO_ASPECT_PATH,
+    TERM_TO_IDX_LOOKUP_PATH,
+    TRAIN_TERMS_PATH,
+)
+from cafa6.utils import get_go_term_weights
+
+
+def build_term_to_aspect(
+    terms_path: str | Path = TRAIN_TERMS_PATH,
+    save_path: str | Path | None = TERM_TO_ASPECT_PATH,
+    cache: bool = True,
+) -> dict[str, str]:
+    if save_path and Path(save_path).exists():
+        with open(save_path, "rb") as f:
+            return pickle.load(f)
+    df = pl.read_csv(terms_path, separator="\t")
+    term_aspect = df.select(["term", "aspect"]).unique()
+    term_to_aspect = dict(zip(term_aspect["term"], term_aspect["aspect"]))
+
+    if cache:
+        if not save_path:
+            raise ValueError("Need save path to cache")
+        with open(save_path, "wb") as f:
+            pickle.dump(term_to_aspect, f)
+
+    return term_to_aspect
+
+
+def build_aspect_masks(
+    terms_to_idx: dict[str, int], term_to_aspect: dict[str, str]
+) -> dict[str, Array]:
+    n_terms = len(terms_to_idx)
+    masks = {"F": jnp.zeros(n_terms), "P": jnp.zeros(n_terms), "C": jnp.zeros(n_terms)}
+
+    for term, idx in terms_to_idx.items():
+        aspect = term_to_aspect.get(term)
+        if aspect in masks:
+            masks[aspect] = masks[aspect].at[idx].set(1.0)
+
+    return masks
+
+
+def weighted_f1_masked(
+    preds: Array, labels: Array, weights: Array, mask: Array, threshold: float
+) -> Array:
+    binary_preds = (preds > threshold).astype(float)
+
+    binary_preds = binary_preds * mask
+    labels = labels * mask
+
+    tp = binary_preds * labels * weights
+    p = binary_preds * weights
+    t = labels * weights
+
+    precision = tp.sum(axis=1) / (p.sum(axis=1) + 1e-8)
+    recall = tp.sum(axis=1) / (t.sum(axis=1) + 1e-8)
+
+    avg_precision = precision.mean()
+    avg_recall = recall.mean()
+
+    f1 = 2 * avg_precision * avg_recall / (avg_precision + avg_recall + 1e-8)
+    return jnp.array(f1)
+
+
+def max_f1_masked(preds: Array, labels: Array, weights: Array, mask: Array) -> Array:
+    thresholds = jnp.linspace(0.01, 0.99, 99)
+
+    def _body(carry, t):
+        return 1, weighted_f1_masked(preds, labels, weights, mask, t)
+
+    _, f1s = jax.lax.scan(_body, 1, xs=thresholds)
+    return jnp.max(f1s)
+
+
+@eqx.filter_jit
+def _evaluate_scores(
+    preds: Array, labels: Array, weights: Array, aspect_masks: dict[str, Array]
+) -> Array:
+    print("_evaluate_scores JIT")
+    f1_mf = max_f1_masked(preds, labels, weights, aspect_masks["F"])
+    f1_bp = max_f1_masked(preds, labels, weights, aspect_masks["P"])
+    f1_cc = max_f1_masked(preds, labels, weights, aspect_masks["C"])
+
+    return (f1_mf + f1_bp + f1_cc) / 3
+
+
+@eqx.filter_jit
+def _get_preds(_model, _e, _n, _t, _m, _c):
+    print("_get_preds JIT")
+    logits = eqx.filter_vmap(_model, in_axes=(0, 0, 0, 0, None, None))(
+        _e, _n, _t, _m, _c, None
+    )
+    preds = jax.nn.sigmoid(logits)
+    return preds
+
+
+def evaluate(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
+    all_preds = []
+    all_labels = []
+
+    inference_model = eqx.nn.inference_mode(model)
+
+    cond_array = jnp.array([condition_val])
+
+    for batch in val_data_loader:
+        idx, esm_emb, neighbor_prior, taxon, mask, y = batch
+        esm_emb, neighbor_prior, taxon, mask, y = (
+            jnp.array(esm_emb),
+            jnp.array(neighbor_prior),
+            jnp.array(taxon),
+            jnp.array(mask),
+            jnp.array(y),
+        )
+
+        preds = _get_preds(
+            inference_model, esm_emb, neighbor_prior, taxon, mask, cond_array
+        )
+
+        all_preds.append(preds)
+        all_labels.append(y)
+
+    all_preds = jnp.concatenate(all_preds, axis=0)
+    all_labels = jnp.concatenate(all_labels, axis=0)
+
+    weights = jnp.array(get_go_term_weights())
+    term_to_aspect = build_term_to_aspect()
+    if not TERM_TO_IDX_LOOKUP_PATH.exists():
+        raise FileNotFoundError(
+            f"{TERM_TO_IDX_LOOKUP_PATH} not found. Run scripts/cafa6_terms_to_idx.py"
+        )
+    term_to_idx_weight = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    term_to_idx = dict(zip(term_to_idx_weight["term"], term_to_idx_weight["index"]))
+    aspect_masks = build_aspect_masks(term_to_idx, term_to_aspect)
+
+    return _evaluate_scores(all_preds, all_labels, weights, aspect_masks)
+from pathlib import Path
+
+import numpy as np
+import obonet
+import polars as pl
+
+from cafa6.constants import (
+    OBO_GRAPH_CHILDREN_PATH,
+    OBO_GRAPH_PARENTS_PATH,
+    OBO_PATH,
+    TERM_TO_IDX_LOOKUP_PATH,
+)
+
+
+def get_graph_edges(terms_to_idx: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    This function parses the obo file to find out which go term is a child of which
+    other go term.
+
+    The returned arrays have the same length and each row of each array corresponds to each other.
+
+    E.g.
+
+    The GO term in row 1 of the children array is the child of the GO term in row 1 of the parent array.
+
+
+    Returns a tuple:
+        children: np.array
+        parents: np.array
+    """
+    if (OBO_GRAPH_CHILDREN_PATH).exists() and (OBO_GRAPH_PARENTS_PATH).exists():
+        return np.load(OBO_GRAPH_CHILDREN_PATH), np.load(OBO_GRAPH_PARENTS_PATH)
+
+    graph = obonet.read_obo(OBO_PATH)
+
+    children = []
+    parents = []
+
+    for child, parent, key in graph.edges(keys=True):
+        if key == "is_a":
+            if child in terms_to_idx and parent in terms_to_idx:
+                child_idx = terms_to_idx[child]
+                parent_idx = terms_to_idx[parent]
+
+                children.append(child_idx)
+                parents.append(parent_idx)
+
+    children, parents = np.array(children), np.array(parents)
+    np.save(OBO_GRAPH_CHILDREN_PATH, children)
+    np.save(OBO_GRAPH_PARENTS_PATH, parents)
+    return children, parents
+
+
+def get_go_term_weights(
+    term_to_idx_lookup_path: str | Path = TERM_TO_IDX_LOOKUP_PATH,
+) -> np.ndarray:
+    if not Path(term_to_idx_lookup_path).exists():
+        raise FileNotFoundError(
+            "Couldn't find the lookup dir! Run scripts/cafa6_terms_to_idx.py!"
+        )
+    df = pl.read_csv(term_to_idx_lookup_path)
+    col = df.select(pl.col("weight"))
+    col = np.array(col).reshape(-1)
+    return col
+import pickle
+import random
+import re
+from pathlib import Path
+from typing import cast
+
+import numpy as np
+import polars as pl
+from beartype.typing import Literal, SupportsIndex
+from Bio import SeqIO
+from grain import DataLoader
+from grain.samplers import IndexSampler
+from grain.sharding import ShardOptions
+from grain.sources import RandomAccessDataSource
+from grain.transforms import Batch, Map
+
+from cafa6.constants import (
+    EMBEDDINGS_PATH,
+    ESM_MODEL,
+    IA_PATH,
+    MODEL_TO_DIMS,
+    TEST_FASTA_PATH,
+    TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH,
+    TEST_NEIGHBOR_MATRIX_PATH,
+    TEST_SUPERSET_TAXON_LOOKUP_PATH,
+    TRAIN_FASTA_EXTENDED_CORRECTED_PATH,
+    TRAIN_FASTA_EXTENDED_PATH,
+    TRAIN_FASTA_PATH,
+    TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH,
+    TRAIN_NEIGHBOR_MATRIX_PATH,
+    TRAIN_TERMS_EXTENDED_PATH,
+    TRAIN_TERMS_PATH,
+)
+
+_SHARED_PRIORS = None
+
+
+class TestDataSource(RandomAccessDataSource):
+    def __init__(
+        self,
+        test_fasta_path: str | Path = TEST_FASTA_PATH,
+    ):
+        self.sequences = []
+        self.protein_ids = []
+        self.taxa = []
+
+        all_sequences = []
+        all_protein_ids = []
+        all_taxi = []
+
+        for record in SeqIO.parse(test_fasta_path, "fasta"):
+            all_sequences.append(str(record.seq))
+            protein_id = record.id.split(" ")[0]
+            taxon = int(record.description.split(" ")[1])
+
+            all_taxi.append(taxon)
+            all_protein_ids.append(protein_id)
+
+        indices = list(range(len(all_sequences)))
+
+        for i in indices:
+            self.sequences.append(all_sequences[i])
+            self.protein_ids.append(all_protein_ids[i])
+            self.taxa.append(all_taxi[i])
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, record_key: SupportsIndex) -> tuple[str, list[str], int]:
+        return (
+            self.protein_ids[record_key],
+            self.sequences[record_key],
+            self.taxa[record_key],
+        )
+
+
+def get_test_loader(batch_size: int = 128, worker_count: int = 4):
+    test_data_source = TestDataSource()
+    terms_to_idx_weight = {}
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    for i, row in enumerate(ia_df.iter_rows(named=True)):
+        terms_to_idx_weight[row["term"]] = (i, row["weight"])
+
+    transformations = [
+        TestMapToArrayAndEmbeddings(
+            str(TEST_NEIGHBOR_MATRIX_PATH),
+            str(TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH),
+            ESM_MODEL,
+        ),
+        Batch(batch_size=batch_size, drop_remainder=False),
+    ]
+
+    sampler = IndexSampler(
+        num_records=len(test_data_source),
+        num_epochs=1,
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
+        shuffle=False,
+        seed=42,
+    )
+    return DataLoader(
+        data_source=test_data_source,
+        operations=transformations,
+        sampler=sampler,
+        worker_count=worker_count,
+    )
+
+
+class DataSource(RandomAccessDataSource):
+    def __init__(
+        self,
+        train_fasta_path: str,
+        train_terms_path: str,
+        indices: list[int] | None = None,
+    ):
+        self.sequences = []
+        self.protein_ids = []
+        self.terms = []
+        self.taxa = []
+
+        terms_df = cast(pl.DataFrame, pl.read_csv(train_terms_path, separator="\t"))
+        terms_grouped = terms_df.group_by("EntryID").agg(pl.col("term")).to_dict()
+        entry_to_terms = dict(zip(terms_grouped["EntryID"], terms_grouped["term"]))
+
+        all_sequences = []
+        all_protein_ids = []
+        all_terms = []
+        all_taxi = []
+
+        for record in SeqIO.parse(train_fasta_path, "fasta"):
+            all_sequences.append(str(record.seq))
+            protein_id = record.id if "|" not in record.id else record.id.split("|")[1]
+            description = record.description
+            taxon = int(re.search(r"(?<=OX=)\d+", description).group(0))  # ty:ignore[possibly-missing-attribute]
+
+            all_taxi.append(taxon)
+            all_protein_ids.append(protein_id)
+            all_terms.append(entry_to_terms.get(protein_id, []))
+
+        if indices is None:
+            indices = list(range(len(all_sequences)))
+
+        for i in indices:
+            self.sequences.append(all_sequences[i])
+            self.protein_ids.append(all_protein_ids[i])
+            self.terms.append(all_terms[i])
+            self.taxa.append(all_taxi[i])
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, record_key: SupportsIndex) -> tuple[str, str, list[str], int]:
+        return (
+            self.protein_ids[record_key],
+            self.sequences[record_key],
+            self.terms[record_key],
+            self.taxa[record_key],
+        )
+
+
+class TestMapToArrayAndEmbeddings(Map):
+    def __init__(
+        self,
+        neighbor_priors_path: str,
+        neighbor_priors_idx_map_path: str,
+        esm_model: str,
+        max_protein_seq: int = 1024,
+        esm_strategy: Literal["mean", "raw"] = "mean",
+        embedding_base_path: str | Path = EMBEDDINGS_PATH,
+        taxon_lookup_path: str | Path = TEST_SUPERSET_TAXON_LOOKUP_PATH,
+    ):
+        self.neighbor_priors_path = neighbor_priors_path
+        self.neighbor_priors_idx_map_path = neighbor_priors_idx_map_path
+        self.taxon_lookup_path = taxon_lookup_path
+
+        with open(neighbor_priors_idx_map_path, "rb") as f:
+            self.pid_to_prior_idx = pickle.load(f)
+
+        self.taxon_to_idx = {}
+        taxon_idx_df = pl.read_csv(self.taxon_lookup_path)
+        for row in taxon_idx_df.iter_rows(named=True):
+            self.taxon_to_idx[row["ID"]] = row["idx"]
+
+        self.embedding_base_path = Path(embedding_base_path)
+        self.esm_model = esm_model
+        self.max_protein_seq = max_protein_seq
+        self.esm_strategy = esm_strategy
+
+    def map(self, element: tuple[str, list[str], int]):
+        global _SHARED_PRIORS
+        if _SHARED_PRIORS is None:
+            _SHARED_PRIORS = np.load(self.neighbor_priors_path, mmap_mode="r")
+
+        protein_id, sequence, taxon = element
+
+        esm_path = (
+            self.embedding_base_path
+            / "test"
+            / self.esm_model
+            / self.esm_strategy
+            / f"{protein_id}.npy"
+        )
+
+        embeddings_esm = np.zeros(
+            shape=(self.max_protein_seq, MODEL_TO_DIMS[self.esm_model])
+        )
+
+        mask = np.zeros((self.max_protein_seq,), dtype=np.float32)
+
+        if esm_path.exists():
+            embeddings_esm_non_trunc = np.load(str(esm_path))
+            if self.esm_strategy == "raw":
+                seq_len, _ = embeddings_esm_non_trunc.shape
+                lens = min(self.max_protein_seq, seq_len)
+                embeddings_esm[:lens] = embeddings_esm_non_trunc[:lens]
+                mask[:lens] = 1.0
+            elif self.esm_strategy == "mean":
+                embeddings_esm = embeddings_esm_non_trunc
+        else:
+            raise FileNotFoundError(f"{esm_path} not found!")
+
+        prior_idx = self.pid_to_prior_idx.get(protein_id)
+        if prior_idx is not None:
+            neighbor_prior = _SHARED_PRIORS[prior_idx]
+        else:
+            raise KeyError(f"Couldn't find priors for {prior_idx}")
+
+        return (
+            protein_id,
+            embeddings_esm,
+            neighbor_prior,
+            self.taxon_to_idx[taxon],
+            mask,
+        )
+
+
+def get_datasources(
+    train_fasta_path=TRAIN_FASTA_EXTENDED_CORRECTED_PATH,
+    train_terms_path=TRAIN_TERMS_EXTENDED_PATH,
+    ratio=0.1,
+):
+    n_total = 0
+    for record in SeqIO.parse(train_fasta_path, "fasta"):
+        n_total += 1
+
+    all_indices = list(range(n_total))
+    random.seed(42)
+    random.shuffle(all_indices)
+
+    val_size = int(n_total * ratio)
+    val_indices = all_indices[:val_size]
+    train_indices = all_indices[val_size:]
+
+    train_data_source = DataSource(
+        str(train_fasta_path), str(train_terms_path), train_indices
+    )
+    val_data_source = DataSource(
+        str(train_fasta_path), str(train_terms_path), val_indices
+    )
+
+    return train_data_source, val_data_source, n_total
+
+
+class MapTermsToArrayAndEmbeddings(Map):
+    def __init__(
+        self,
+        terms_to_idx_weight: dict,
+        neighbor_priors_path: str,
+        neighbor_priors_idx_map_path: str,
+        esm_model: str,
+        max_protein_seq: int = 1024,
+        esm_strategy: Literal["mean", "raw"] = "mean",
+        embedding_base_path: str | Path = EMBEDDINGS_PATH,
+        taxon_lookup_path: str | Path = TEST_SUPERSET_TAXON_LOOKUP_PATH,
+    ):
+        self.terms_to_idx_weight = terms_to_idx_weight
+
+        self.neighbor_priors_path = neighbor_priors_path
+        self.neighbor_priors_idx_map_path = neighbor_priors_idx_map_path
+        self.taxon_lookup_path = taxon_lookup_path
+
+        with open(neighbor_priors_idx_map_path, "rb") as f:
+            self.pid_to_prior_idx = pickle.load(f)
+
+        self.taxon_to_idx = {}
+        taxon_idx_df = pl.read_csv(self.taxon_lookup_path)
+        for row in taxon_idx_df.iter_rows(named=True):
+            self.taxon_to_idx[row["ID"]] = row["idx"]
+
+        self.embedding_base_path = Path(embedding_base_path)
+        self.esm_model = esm_model
+        self.max_protein_seq = max_protein_seq
+        self.esm_strategy = esm_strategy
+
+    def map(self, element: tuple[str, str, list[str], int]):
+        global _SHARED_PRIORS
+        if _SHARED_PRIORS is None:
+            _SHARED_PRIORS = np.load(self.neighbor_priors_path, mmap_mode="r")
+
+        protein_id, sequence, terms, taxon = element
+        indices = np.array([self.terms_to_idx_weight[t][0] for t in terms])
+
+        labels = np.zeros(len(self.terms_to_idx_weight), dtype=np.float32)
+        labels[indices] = 1.0
+
+        esm_path = (
+            self.embedding_base_path
+            / "train"
+            / self.esm_model
+            / self.esm_strategy
+            / f"{protein_id}.npy"
+        )
+
+        embeddings_esm = np.zeros(
+            shape=(self.max_protein_seq, MODEL_TO_DIMS[self.esm_model])
+        )
+
+        mask = np.zeros((self.max_protein_seq,), dtype=np.float32)
+
+        if esm_path.exists():
+            embeddings_esm_non_trunc = np.load(str(esm_path))
+            if self.esm_strategy == "raw":
+                seq_len, _ = embeddings_esm_non_trunc.shape
+                lens = min(self.max_protein_seq, seq_len)
+                embeddings_esm[:lens] = embeddings_esm_non_trunc[:lens]
+                mask[:lens] = 1.0
+            elif self.esm_strategy == "mean":
+                embeddings_esm = embeddings_esm_non_trunc
+        else:
+            raise FileNotFoundError(f"{esm_path} not found!")
+
+        prior_idx = self.pid_to_prior_idx.get(protein_id)
+        if prior_idx is not None:
+            neighbor_prior = _SHARED_PRIORS[prior_idx]
+        else:
+            neighbor_prior = np.zeros(len(self.terms_to_idx_weight), dtype=np.float32)
+
+        return (
+            protein_id,
+            embeddings_esm,
+            neighbor_prior,
+            self.taxon_to_idx[taxon],
+            mask,
+            labels,
+        )
+
+
+def get_transformations(batch_size: int = 128, drop_remainder=True):
+    """Get the data transformations for training/validation."""
+    terms_to_idx_weight = {}
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    for i, row in enumerate(ia_df.iter_rows(named=True)):
+        terms_to_idx_weight[row["term"]] = (i, row["weight"])
+
+    transformations = [
+        MapTermsToArrayAndEmbeddings(
+            terms_to_idx_weight,
+            str(TRAIN_NEIGHBOR_MATRIX_PATH),
+            str(TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH),
+            ESM_MODEL,
+        ),
+        Batch(batch_size=batch_size, drop_remainder=drop_remainder),
+    ]
+    return transformations
+
+
+def create_train_loader(
+    train_data_source,
+    transformations,
+    batch_size: int = 128,
+    num_epochs: int = 8,
+    worker_count: int = 0,
+):
+    train_sampler = IndexSampler(
+        num_records=len(train_data_source),
+        num_epochs=num_epochs,
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
+        shuffle=True,
+        seed=42,
+    )
+    return DataLoader(
+        data_source=train_data_source,
+        operations=transformations,
+        sampler=train_sampler,
+        worker_count=worker_count,
+    )
+
+
+def create_val_loader(val_data_source, transformations):
+    val_sampler = IndexSampler(
+        num_records=len(val_data_source),
+        num_epochs=1,
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
+        shuffle=False,
+        seed=0,
+    )
+    return DataLoader(
+        data_source=val_data_source,
+        operations=transformations,
+        sampler=val_sampler,
+        worker_count=0,
+    )
+from pathlib import Path
+
+import polars as pl
+
+from cafa6.constants import TEST_SUPERSET_TAXON_LOOKUP_PATH, TEST_SUPERSET_TAXON_PATH
+
+
+def taxons_to_idx(
+    taxons_path: str | Path = TEST_SUPERSET_TAXON_PATH,
+    test_superset_taxon_lookup_path: str
+    | Path
+    | None = TEST_SUPERSET_TAXON_LOOKUP_PATH,
+    cache: bool = True,
+) -> pl.DataFrame:
+    """
+    Generates a dataframe which maps a taxon id (from a fasta file)
+    to a unique integer. This can be used to construct one-hot encoded
+    vectors for taxons.
+
+    E.g. like this
+    ```python
+        filtered_frame = taxon_to_idx_df.filter(pl.col("ID").is_in([35659, 45621]))
+        # these are the idx to make one-hot encoded vectors, i.e. set those to 1
+    ```
+    """
+
+    if (
+        test_superset_taxon_lookup_path
+        and Path(test_superset_taxon_lookup_path).exists()
+    ):
+        return pl.read_csv(test_superset_taxon_lookup_path)
+
+    testset_taxons = pl.read_csv(taxons_path, separator="\t")
+    unique_ids = testset_taxons.select(pl.col("ID")).unique()
+    taxon_to_idx = []
+    for i, idx in enumerate(unique_ids.iter_rows(named=True)):
+        taxon_to_idx.append({"ID": idx["ID"], "idx": i})
+
+    taxon_to_idx_df = pl.DataFrame(taxon_to_idx)
+    if cache:
+        if not test_superset_taxon_lookup_path:
+            raise ValueError("Need location for cache")
+        taxon_to_idx_df.write_csv(test_superset_taxon_lookup_path)
+    return taxon_to_idx_df
+
+
+if __name__ == "__main__":
+    taxons_to_idx()
+import json
+from pathlib import Path
+from typing import cast
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import polars as pl
+from tqdm import tqdm
+
+from cafa6.constants import (
+    PARTIAL_SUBMISSION_FULL_PATH,
+    TERM_TO_IDX_LOOKUP_PATH,
+    WEIGHTS_BASE_PATH,
+)
+from cafa6.data import get_test_loader
+from cafa6.model import Model
+
+
+@eqx.filter_jit
+def _get_top_preds(
+    model, embeddings_esm, neighbor_priors, taxons, masks, condition, preds_per_term
+):
+    preds = eqx.filter_vmap(model, in_axes=(0, 0, 0, 0, None, None))(
+        embeddings_esm, neighbor_priors, taxons, masks, condition, None
+    )
+    preds = jax.nn.sigmoid(preds)
+    top_values, top_indices = jax.lax.top_k(preds, preds_per_term)
+    return top_indices, top_values
+
+
+def create_submission(
+    model_path: str | Path,
+    model_config_path: str | Path,
+    preds_per_term: int = 50,
+    batch_size: int = 128,
+    worker_count: int = 4,
+):
+    terms_to_idx_df = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+
+    with open(WEIGHTS_BASE_PATH / model_config_path, "r") as f:
+        model_config = json.load(f)
+
+    model = Model(
+        **model_config,
+        key=jax.random.key(0),
+    )
+
+    model = eqx.tree_deserialise_leaves(model_path, model)
+    model = eqx.nn.inference_mode(model)
+    model = eqx.filter_jit(model)
+
+    test_dataloader = get_test_loader(batch_size, worker_count)
+    condition = jnp.array([25.0])
+
+    buffer_ids = []
+    buffer_indices = []
+    buffer_values = []
+
+    for batch in tqdm(test_dataloader):
+        protein_ids, embeddings_esm, neighbor_priors, taxons, masks = batch
+
+        top_indices, top_values = _get_top_preds(
+            model,
+            embeddings_esm,
+            neighbor_priors,
+            taxons,
+            masks,
+            condition,
+            preds_per_term,
+        )
+
+        top_indices = np.array(top_indices).flatten()
+        top_values = np.array(top_values).flatten()
+        protein_ids_repeated = np.repeat(protein_ids, preds_per_term)
+
+        buffer_ids.extend(protein_ids_repeated)
+        buffer_indices.extend(top_indices)
+        buffer_values.extend(top_values)
+
+    raw_submission = pl.DataFrame(
+        {"EntryID": buffer_ids, "index": buffer_indices, "value": buffer_values}
+    )
+
+    raw_submission = raw_submission.cast({"index": pl.Int64})
+
+    current_preds = raw_submission.join(terms_to_idx_df, on="index", how="left")
+    current_preds = current_preds.select(["EntryID", "term", "value"])
+
+    partial_submission = pl.read_csv(PARTIAL_SUBMISSION_FULL_PATH)
+    partial_submission = partial_submission.unique(subset=["EntryID", "term"])
+
+    new_preds = current_preds.join(
+        partial_submission, on=["EntryID", "term"], how="anti"
+    )
+    new_preds = new_preds.cast({"value": pl.Float64})
+
+    final_submission = new_preds.vstack(partial_submission)
+    final_submission = cast(pl.DataFrame, final_submission)
+
+    final_submission.write_csv("submission.tsv", include_header=False, separator="\t")
+
+
+if __name__ == "__main__":
+    model_name = "crouching-axiomatic-panda"
+    model_path = WEIGHTS_BASE_PATH / f"{model_name}.eqx"
+    model_config_path = WEIGHTS_BASE_PATH / f"{model_name}-config.json"
+    create_submission(
+        model_path,
+        model_config_path,
+    )
+from pathlib import Path
+
+import polars as pl
+from fire import Fire
+
+from cafa6.constants import IA_PATH, TERM_TO_IDX_LOOKUP_PATH
+
+
+def generate_term_to_idx_lookup(
+    ia_path: str | Path = IA_PATH,
+    save_path: str | Path | None = TERM_TO_IDX_LOOKUP_PATH,
+    cache: bool = True,
+) -> pl.DataFrame:
+    """
+    This function generates a DataFrame which serves as a lookup table to map
+    an index to a term and vice versa. If a save path is provided, it will load the DF from
+    there (and save it there later if cached is true).
+    Returns:
+        polars dataframe
+    """
+    if save_path and Path(save_path).exists():
+        return pl.read_csv(save_path)
+
+    ia_df = pl.read_csv(ia_path, separator="\t")
+    terms_to_idx_weight = []
+    for i, row in enumerate(ia_df.iter_rows(named=True)):
+        terms_to_idx_weight.append(
+            {"term": row["term"], "index": i, "weight": row["weight"]}
+        )
+    df = pl.DataFrame(terms_to_idx_weight)
+    if cache:
+        if not save_path:
+            raise ValueError("Need save path to cache")
+        df.write_csv(save_path)
+
+    return df
+
+
+if __name__ == "__main__":
+    Fire(generate_term_to_idx_lookup)
+import gc
+import gzip
+import re
+import sys
+from pathlib import Path
+
+import polars as pl
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+from loguru import logger
+from tqdm import tqdm
+
+from cafa6.constants import (
+    DATA_BASE_PATH,
+    GOA_UNIPROT_ALL_GAF_PATH,
+    GOA_UNIPROT_TEST_PREDS_PATH,
+    PARTIAL_SUBMISSION_PATH,
+    TERM_TO_IDX_LOOKUP_PATH,
+    TEST_FASTA_PATH,
+    TRAIN_FASTA_EXTENDED_PATH,
+    TRAIN_FASTA_PATH,
+    TRAIN_FASTA_UNIPROT_PATH,
+    TRAIN_TERMS_EXTENDED_PATH,
+    TRAIN_TERMS_PATH,
+    TRAIN_TERMS_UNIPROT_PATH,
+)
+
+
+def extract_go_terms_from_uniprot(
+    goa_uniprot_all_gaf_path: str | Path = GOA_UNIPROT_ALL_GAF_PATH,
+    goa_uniprot_test_preds_path: str | Path | None = GOA_UNIPROT_TEST_PREDS_PATH,
+    cache: bool = True,
+) -> pl.DataFrame:
+    """
+    **This function has side-effects**
+
+    This function iterates over the goa_uniprot_all.gaf file and extracts
+    all the go terms in can find for each protein in there.
+
+    This will be later used as a lookup library. Basically, when making our submission,
+    we shouldn't trust the GO term predictions from our model, because we already have
+    experimentally verified GO terms from uniprot. Thus, we will treat this as the
+    ground truth.
+
+    This function returns the result as a dataframe but also caches it. If a file in the given
+    preds path already exists, it will load it instead.
+
+
+    Returns:
+        the polars dataframe
+    """
+
+    if goa_uniprot_test_preds_path and Path(goa_uniprot_test_preds_path).exists():
+        return pl.read_csv(goa_uniprot_test_preds_path)
+
+    data_buffer = []
+    counter = 0
+    chunk_counter = 0
+
+    go_terms_df = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    go_terms = go_terms_df.get_column("term").unique()
+    go_terms = set(go_terms)
+
+    with gzip.open(goa_uniprot_all_gaf_path, "rt") as f:
+        for line in tqdm(f, mininterval=1.0, desc="Scanning GAF"):
+            if line.startswith("!"):
+                continue
+
+            splits = line.split("\t")
+
+            if len(splits) < 5:
+                continue
+
+            counter += 1
+            protein_id = splits[1]
+            qualifier = splits[3]
+            go_term = splits[4]
+
+            if "NOT" in qualifier:
+                continue
+
+            if go_term not in go_terms:
+                continue
+
+            data_buffer.append({"EntryID": protein_id, "term": go_term, "value": 1.0})
+            if counter % 50_000_000 == 0:
+                df = pl.DataFrame(data_buffer)
+                df.write_csv(
+                    Path(DATA_BASE_PATH) / "gaf_chunks" / f"{chunk_counter}.csv"
+                )
+                chunk_counter += 1
+                del df
+                data_buffer = []
+                gc.collect()
+
+    if data_buffer:
+        df = pl.DataFrame(data_buffer)
+        df.write_csv(Path(DATA_BASE_PATH) / f"{chunk_counter}.csv")
+        chunk_counter += 1
+    chunks = [
+        pl.read_csv(Path(DATA_BASE_PATH) / "gaf_chunks" / f"{i}.csv")
+        for i in range(chunk_counter)
+    ]
+    df = pl.concat(chunks)
+    df = df.unique()
+
+    if cache:
+        if not goa_uniprot_test_preds_path:
+            raise ValueError("Path expected if supposed to cache!")
+        df.write_csv(
+            goa_uniprot_test_preds_path
+        )  # you gotta have enough RAM for this (which I don't so it crased xd)
+    return df
+
+
+def get_existing_go_terms_for_testset(
+    test_fasta_path: str | Path = TEST_FASTA_PATH,
+    partial_submission_path: str | Path = PARTIAL_SUBMISSION_PATH,
+):
+    protein_ids_set = set()
+    for record in tqdm(SeqIO.parse(test_fasta_path, "fasta")):
+        protein_id = record.id
+        protein_ids_set.add(protein_id)
+
+    chunk_paths = []
+    total_chunks = 23  # you get this number if you ran the above function
+    for chunk in range(total_chunks):
+        chunk_paths.append(DATA_BASE_PATH / "gaf_chunks" / f"{chunk}.csv")
+
+    lazy_df = pl.scan_csv(chunk_paths)
+    protein_ids_list = list(protein_ids_set)
+    filtered_lazy = lazy_df.filter(pl.col("EntryID").is_in(protein_ids_list))
+
+    filtered_lazy.sink_csv(partial_submission_path)
+
+
+def create_extended_train_terms_from_uniprot(
+    goa_uniprot_all_gaf_path: str | Path = GOA_UNIPROT_ALL_GAF_PATH,
+    train_terms_uniprot_path: str | Path = TRAIN_TERMS_UNIPROT_PATH,
+    extended_fasta_path: str | Path = TRAIN_FASTA_UNIPROT_PATH,
+    cache: bool = True,
+):
+    if train_terms_uniprot_path and Path(train_terms_uniprot_path).exists():
+        return pl.read_csv(train_terms_uniprot_path)
+
+    test_protein_sequences = {}
+    for record in tqdm(SeqIO.parse(TEST_FASTA_PATH, "fasta"), desc="Loading Test Seqs"):
+        test_protein_sequences[record.id] = str(record.seq)
+
+    csv_buffer = []
+    found_proteins_map = {}
+    chunk_counter = 0
+
+    go_terms_df = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    valid_go_terms = set(go_terms_df["term"])
+
+    gaf_chunks_dir = Path(DATA_BASE_PATH) / "gaf_chunks"
+    gaf_chunks_dir.mkdir(exist_ok=True, parents=True)
+
+    with gzip.open(goa_uniprot_all_gaf_path, "rt") as f:
+        for line in tqdm(f, mininterval=1.0, desc="Scanning GAF"):
+            if line.startswith("!"):
+                continue
+
+            splits = line.split("\t")
+            if len(splits) < 15:
+                continue
+
+            protein_id = splits[1]
+            if protein_id not in test_protein_sequences:
+                continue
+
+            qualifier = splits[3]
+            if "NOT" in qualifier:
+                continue
+
+            go_term = splits[4]
+            if go_term not in valid_go_terms:
+                continue
+
+            aspect = splits[8]
+            taxon_raw = splits[12]
+            taxon = taxon_raw.split(":")[1] if ":" in taxon_raw else taxon_raw
+
+            csv_buffer.append(
+                {"EntryID": protein_id, "term": go_term, "aspect": aspect}
+            )
+
+            found_proteins_map[protein_id] = taxon
+
+            if len(csv_buffer) >= 1_000_000:
+                df = pl.DataFrame(csv_buffer)
+                df.write_csv(gaf_chunks_dir / f"{chunk_counter}-train-terms.csv")
+                chunk_counter += 1
+                csv_buffer = []
+
+    if csv_buffer:
+        df = pl.DataFrame(csv_buffer)
+        df.write_csv(gaf_chunks_dir / f"{chunk_counter}-train-terms.csv")
+        chunk_counter += 1
+
+    print(f"Creating extended FASTA with {len(found_proteins_map)} new proteins...")
+
+    with open(extended_fasta_path, "w") as f_out:
+        original_records = SeqIO.parse(TRAIN_FASTA_PATH, "fasta")
+        SeqIO.write(original_records, f_out, "fasta")
+
+        new_records = []
+        for protein_id, taxon in found_proteins_map.items():
+            new_records.append(
+                SeqRecord(
+                    Seq(test_protein_sequences[protein_id]),
+                    id=protein_id,
+                    description=f"OX={taxon}",
+                )
+            )
+        SeqIO.write(new_records, f_out, "fasta")
+
+    chunks = [pl.read_csv(p) for p in gaf_chunks_dir.glob("*-train-terms.csv")]
+
+    if not chunks:
+        raise ValueError("No matching data found in GAF file!")
+
+    final_df = pl.concat(chunks)
+    final_df = final_df.unique()
+
+    if cache:
+        final_df.write_csv(train_terms_uniprot_path)
+
+    return final_df
+
+
+def combine_uniprot_and_train_sets():
+    combined_records = []
+    protein_ids_set = set()
+    for record in SeqIO.parse(TRAIN_FASTA_UNIPROT_PATH, "fasta"):
+        protein_id = record.id if "|" not in record.id else record.id.split("|")[1]
+        if protein_id in protein_ids_set:
+            continue
+        protein_ids_set.add(protein_id)
+        description = record.description
+        match = re.search(r"(?<=OX=)\d+", description)
+        taxon = int(match.group(0)) if match else 9606
+
+        combined_records.append(
+            SeqRecord(
+                Seq(record.seq),
+                id=protein_id,
+                description=f"OX={taxon}",
+            )
+        )
+    with open(TRAIN_FASTA_EXTENDED_PATH, "w") as f_out:
+        SeqIO.write(combined_records, f_out, "fasta")
+
+    train_terms = pl.read_csv(TRAIN_TERMS_PATH, separator="\t")
+    train_terms_extended = pl.read_csv(TRAIN_TERMS_UNIPROT_PATH)
+
+    train_terms_diff = train_terms_extended.join(
+        train_terms, on=["EntryID", "term"], how="anti"
+    )
+
+    combined_df = pl.concat([train_terms, train_terms_diff])
+    combined_df.write_csv(TRAIN_TERMS_EXTENDED_PATH, separator="\t")
+
+
+if __name__ == "__main__":
+    # create_extended_train_terms_from_uniprot()
+    # extract_go_terms_from_uniprot()
+    # get_existing_go_terms_for_testset()
+    combine_uniprot_and_train_sets()
+import polars as pl
+from loguru import logger
+
+from cafa6.constants import (
+    PARTIAL_SUBMISSION_FULL_PATH,
+    PARTIAL_SUBMISSION_PATH,
+    TRAIN_TERMS_PATH,
+)
+
+
+def compute_uniprot_train_terms_overlap():
+    partial_submission = pl.read_csv(PARTIAL_SUBMISSION_PATH)
+
+    train_terms = pl.read_csv(TRAIN_TERMS_PATH, separator="\t")
+    train_terms = train_terms.with_columns(pl.lit(1.0).alias("value"))
+    train_terms = train_terms.select(["EntryID", "term", "value"])
+
+    anti_join = train_terms.join(partial_submission, on=["EntryID", "term"], how="anti")
+
+    logger.info(f"Adding {len(anti_join)} new terms from training set")
+
+    partial_submission = pl.concat([partial_submission, anti_join])
+    partial_submission.write_csv(PARTIAL_SUBMISSION_FULL_PATH)
+
+
+if __name__ == "__main__":
+    compute_uniprot_train_terms_overlap()
+import os
+from pathlib import Path
+
+import polars as pl
+from tqdm import tqdm
+
+from cafa6.constants import EMBEDDINGS_PATH, ESM_MODEL, TRAIN_TERMS_EXTENDED_PATH
+
+# Adjust path to your final combined training file
+
+EMBEDDINGS_DIR = EMBEDDINGS_PATH / f"train/{ESM_MODEL}/mean"
+
+
+def remove_ghost_embeddings():
+    print("Loading valid IDs...")
+    # Get the set of all IDs that actually have labels
+    df = pl.read_csv(TRAIN_TERMS_EXTENDED_PATH)
+    valid_ids = set(df["EntryID"])
+
+    print(f"Found {len(valid_ids)} valid labeled proteins.")
+
+    files_in_dir = list(EMBEDDINGS_DIR.glob("*.npy"))
+    print(f"Scanning {len(files_in_dir)} files in embedding directory...")
+
+    deleted_count = 0
+
+    for file_path in tqdm(files_in_dir):
+        # Extract ID: "path/to/Q9Z.npy" -> "Q9Z"
+        pid = file_path.stem
+
+        if pid not in valid_ids:
+            # This is a ghost (test protein with no labels)
+            os.remove(file_path)
+            deleted_count += 1
+
+    print(f"Cleanup complete. Deleted {deleted_count} ghost embeddings.")
+
+
+if __name__ == "__main__":
+    remove_ghost_embeddings()
+import gc
+import os
+import pickle
+
+import faiss
+import numpy as np
+import polars as pl
+from beartype.typing import Literal
+from tqdm import tqdm
+
+from cafa6.constants import (
+    EMBEDDINGS_PATH,
+    ESM_MODEL,
+    IA_PATH,
+    MODEL_TO_DIMS,
+    PARTIAL_SUBMISSION_FULL_PATH,
+    TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH,
+    TEST_NEIGHBOR_MATRIX_PATH,
+    TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH,
+    TRAIN_NEIGHBOR_MATRIX_PATH,
+)
+
+
+def generate_neighbor_priors_matrix(target_set: Literal["train", "test"], k: int = 6):
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    terms_to_idx = {row["term"]: i for i, row in enumerate(ia_df.iter_rows(named=True))}
+    n_terms = len(terms_to_idx)
+    embed_dim = MODEL_TO_DIMS[ESM_MODEL]
+
+    source_path = EMBEDDINGS_PATH / f"train/{ESM_MODEL}/mean"
+    target_path = EMBEDDINGS_PATH / f"{target_set}/{ESM_MODEL}/mean"
+
+    source_ids = [pid.replace(".npy", "") for pid in os.listdir(source_path)]
+    source_pid_to_idx = {pid: i for i, pid in enumerate(source_ids)}
+    n_source = len(source_ids)
+
+    print(f"Loading {n_source} SOURCE embeddings (float32)...")
+    source_embeddings = np.stack(
+        [np.load(f"{source_path}/{pid}.npy") for pid in tqdm(source_ids)]
+    ).astype(np.float32)
+
+    faiss.normalize_L2(source_embeddings)
+
+    print("Building Source Label Matrix (float16)...")
+    source_labels = np.zeros((n_source, n_terms), dtype=np.float16)
+    all_known_terms_df = pl.read_csv(PARTIAL_SUBMISSION_FULL_PATH)
+
+    source_ids_set = set(source_ids)
+    valid_rows = all_known_terms_df.filter(pl.col("EntryID").is_in(source_ids_set))
+
+    for row in tqdm(valid_rows.iter_rows(named=True)):
+        pid = row["EntryID"]
+        term = row["term"]
+        if term in terms_to_idx:
+            source_labels[source_pid_to_idx[pid], terms_to_idx[term]] = 1.0
+
+    target_ids = [pid.replace(".npy", "") for pid in os.listdir(target_path)]
+    n_target = len(target_ids)
+
+    print(f"Loading {n_target} TARGET embeddings (float16)...")
+    target_embeddings = np.stack(
+        [np.load(f"{target_path}/{pid}.npy") for pid in tqdm(target_ids)]
+    ).astype(np.float16)
+
+    print("Building Index...")
+    index = faiss.IndexFlatIP(embed_dim)  # ty:ignore[possibly-missing-attribute]
+    index.add(source_embeddings)  # ty:ignore[missing-argument]
+
+    neighbor_priors = np.zeros(shape=(n_target, n_terms), dtype=np.float16)
+    batch_size = 1000
+
+    print("Searching Neighbors...")
+    for start in tqdm(range(0, n_target, batch_size)):
+        end = min(start + batch_size, n_target)
+
+        queries_f16 = target_embeddings[start:end]
+        queries_f32 = queries_f16.astype(np.float32)
+        faiss.normalize_L2(queries_f32)
+
+        search_k = k + 1 if target_set == "train" else k
+        distances, indices = index.search(queries_f32, search_k)  # ty:ignore[missing-argument]
+
+        for i, neighbors in enumerate(indices):
+            if target_set == "train":
+                neighbors = neighbors[1:]
+
+            neighbor_labels = source_labels[neighbors]
+            neighbor_priors[start + i] = neighbor_labels.mean(axis=0).astype(np.float16)
+
+        del queries_f16, queries_f32
+        gc.collect()
+
+    save_path = (
+        TRAIN_NEIGHBOR_MATRIX_PATH
+        if target_set == "train"
+        else TEST_NEIGHBOR_MATRIX_PATH
+    )
+    np.save(save_path, neighbor_priors)
+
+    target_pid_to_idx = {pid: i for i, pid in enumerate(target_ids)}
+    idx_map_save_path = (
+        TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH
+        if target_set == "train"
+        else TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH
+    )
+    with open(idx_map_save_path, "wb") as f:
+        pickle.dump(target_pid_to_idx, f)
+
+
+if __name__ == "__main__":
+    # generate_neighbor_priors_matrix("train")
+    generate_neighbor_priors_matrix("test")
+import re
+
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+
+from cafa6.constants import (
+    TEST_FASTA_PATH,
+    TRAIN_FASTA_EXTENDED_CORRECTED_PATH,
+    TRAIN_FASTA_EXTENDED_PATH,
+)
+
+
+def fix_unsupported_taxons():
+    new_records = []
+
+    test_set = {}
+
+    counter = 0
+
+    for record in SeqIO.parse(TEST_FASTA_PATH, "fasta"):
+        protein_id = record.id.split(" ")[0]
+        taxon = int(record.description.split(" ")[-1])
+        test_set[protein_id] = taxon
+
+    for record in SeqIO.parse(TRAIN_FASTA_EXTENDED_PATH, "fasta"):
+        protein_id = record.id
+        description = record.description
+        taxon = int(re.search(r"(?<=OX=)\d+", description).group(0))  # ty:ignore[possibly-missing-attribute]
+
+        if protein_id in test_set:
+            if taxon != test_set[protein_id]:
+                counter += 1
+            taxon = test_set[protein_id]
+
+        else:
+            print(f"{protein_id=} not found in test set")
+
+        new_records.append(
+            SeqRecord(Seq(record.seq), id=protein_id, description=f"OX={taxon}")
+        )
+
+    print(f"Found {counter} proteins with different taxons than expected.")
+    print(f"New training length is {len(new_records)}")
+    with open(TRAIN_FASTA_EXTENDED_CORRECTED_PATH, "w") as f_out:
+        SeqIO.write(new_records, f_out, "fasta")
+
+
+if __name__ == "__main__":
+    fix_unsupported_taxons()
+import pathlib
+
+MODEL_TO_DIMS: dict[str, int] = {
+    "esmc_600m": 1152,
+}
+
+ESM_MODEL = "esmc_600m"
+
+DATA_BASE_PATH = pathlib.Path(__file__).parent.parent / "data"
+WEIGHTS_BASE_PATH = pathlib.Path(__file__).parent.parent / "weights"
+EMBEDDINGS_PATH = DATA_BASE_PATH / "embeddings"
+
+TRAIN_FASTA_PATH = DATA_BASE_PATH / "train/train_sequences.fasta"
+TRAIN_FASTA_UNIPROT_PATH = DATA_BASE_PATH / "train/train_sequences_uniprot.fasta"
+TRAIN_FASTA_EXTENDED_PATH = DATA_BASE_PATH / "train/train_sequences_extended.fasta"
+TRAIN_FASTA_EXTENDED_CORRECTED_PATH = (
+    DATA_BASE_PATH / "train/train_sequences_extended_corrected.fasta"
+)
+TRAIN_TERMS_PATH = DATA_BASE_PATH / "train/train_terms.tsv"
+TRAIN_TERMS_UNIPROT_PATH = DATA_BASE_PATH / "train/train_terms_uniprot.tsv"
+TRAIN_TERMS_EXTENDED_PATH = DATA_BASE_PATH / "train/train_terms_extended.tsv"
+OBO_PATH = DATA_BASE_PATH / "train/go-basic.obo"
+TEST_FASTA_PATH = DATA_BASE_PATH / "test/testsuperset.fasta"
+IA_PATH = DATA_BASE_PATH / "IA.tsv"
+IA_PATH_NO_HEAD = DATA_BASE_PATH / "IA_NO_HEAD.tsv"
+
+TERM_TO_ASPECT_PATH = DATA_BASE_PATH / "term_to_aspect.pkl"
+
+OBO_GRAPH_CHILDREN_PATH = DATA_BASE_PATH / "go_terms_children.npy"
+OBO_GRAPH_PARENTS_PATH = DATA_BASE_PATH / "go_terms_parent.npy"
+
+GOA_UNIPROT_ALL_GAF_PATH = DATA_BASE_PATH / "goa_uniprot_all.gaf.gz"
+GOA_UNIPROT_TEST_PREDS_PATH = DATA_BASE_PATH / "goa_uniprot_all_test_preds.tsv"
+
+TERM_TO_IDX_LOOKUP_PATH = DATA_BASE_PATH / "term_to_idx_lookup.tsv"
+
+TEST_SUPERSET_TAXON_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-list.tsv"
+TEST_SUPERSET_TAXON_LOOKUP_PATH = DATA_BASE_PATH / "test/testsuperset-taxon-lookup.tsv"
+PARTIAL_SUBMISSION_PATH = DATA_BASE_PATH / "partial_submission.csv"
+PARTIAL_SUBMISSION_FULL_PATH = DATA_BASE_PATH / "partial_submission_full.csv"
+
+TRAIN_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "neighbor_matrix_path_train.npy"
+TEST_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "neighbor_matrix_path_test.npy"
+
+TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH = (
+    DATA_BASE_PATH / "neighbor_matrix_path_train_idx_map.pkl"
+)
+TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH = (
+    DATA_BASE_PATH / "neighbor_matrix_path_test_idx_map.pkl"
+)
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Float, Int, PRNGKeyArray
+
+
+class AttentionPooling(eqx.Module):
+    """
+    Unused; Mean-Pooling works good enough
+    """
+
+    layer: eqx.nn.Linear
+
+    def __init__(self, in_size: int, key: PRNGKeyArray):
+        self.layer = eqx.nn.Linear(in_size, 1, key=key)
+
+    def __call__(
+        self,
+        x: Float[Array, "max_seq_len embed_dim"],
+        mask: Float[Array, "max_seq_len"],
+    ) -> Array:
+        scores = jnp.squeeze(eqx.filter_vmap(self.layer)(x))
+        scores = jnp.where(mask == 1, scores, -1e9)
+        weights = jax.nn.softmax(scores)
+        weighted_embeddings = x * weights[:, None]
+        pooled = jnp.sum(weighted_embeddings, axis=0)
+        return pooled
+
+
+class ESMModel(eqx.Module):
+    mlp: eqx.nn.MLP
+    prior_scale: Array
+
+    def __init__(
+        self,
+        in_size: int,
+        out_size: int,
+        depth: int,
+        width_size: int,
+        *,
+        key: PRNGKeyArray,
+    ):
+        k1, k2 = jax.random.split(key, 2)
+
+        self.mlp = eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            depth=depth,
+            width_size=width_size,
+            activation=jax.nn.gelu,
+            key=k2,
+        )
+
+        self.prior_scale = jnp.array(0.1)
+
+    def __call__(self, esm_emb: Array, neighbor_prior: Float[Array, "n_terms"]):
+        logits = self.mlp(esm_emb)
+        clamped_prior = jnp.clip(neighbor_prior, 0.01, 0.99)
+        prior_logits = jnp.log(clamped_prior) - jnp.log(1 - clamped_prior)
+        logits = logits + self.prior_scale * prior_logits
+
+        return logits
+
+
+class DeepGOModel(eqx.Module):
+    term_centers: eqx.nn.Embedding
+    term_radii: Array
+
+    has_function: Array
+    mlp: eqx.nn.MLP
+
+    def __init__(
+        self,
+        n_terms: int,
+        embedding_size: int,
+        esm_embedding_size: int,
+        esm_proj_width_size: int,
+        esm_proj_depth: int,
+        *,
+        key: PRNGKeyArray,
+    ):
+        key, mlp_key, radii_key, fn_key = jax.random.split(key, 4)
+        self.term_centers = eqx.nn.Embedding(n_terms, embedding_size, key=key)
+        self.term_radii = jax.random.normal(key=radii_key, shape=(n_terms, 1))
+        self.has_function = jax.random.normal(key=fn_key, shape=(embedding_size,))
+        self.mlp = eqx.nn.MLP(
+            in_size=esm_embedding_size,
+            out_size=embedding_size,
+            width_size=esm_proj_width_size,
+            depth=esm_proj_depth,
+            activation=jax.nn.gelu,
+            key=mlp_key,
+        )
+
+    def __call__(
+        self,
+        esm_emb: Float[Array, "esm_embs"],
+        key: PRNGKeyArray | None = None,
+    ):
+        protein_proj = self.mlp(esm_emb).reshape(1, -1)  # 1 x E
+        term_centers = self.term_centers.weight
+        shifted_term_centers = (term_centers + self.has_function).T  # E x N
+        similarity_vector = (
+            protein_proj @ shifted_term_centers
+        )  # 1 x E times E x N = 1 x N
+
+        return (similarity_vector + self.term_radii.T).squeeze()
+
+
+class Model(eqx.Module):
+    # attn_pool: AttentionPooling
+
+    deepgo: DeepGOModel
+
+    taxa_embeddings: eqx.nn.Embedding
+    taxa_norm: eqx.nn.LayerNorm
+    taxa_mlp: eqx.nn.MLP
+
+    esm_model: ESMModel
+    esm_norm: eqx.nn.LayerNorm
+
+    taxa_weight: Array
+    esm_weight: Array
+    deepgo_weight: Array
+
+    condition_mlp: eqx.nn.MLP
+
+    dropout: eqx.nn.Dropout
+    inference: bool
+
+    def __init__(
+        self,
+        n_terms: int,
+        embedding_size: int,
+        esm_embedding_size: int,
+        esm_proj_width_size: int,
+        esm_proj_depth: int,
+        taxa_vocab_size: int,
+        taxa_embedding_size: int,
+        taxa_mlp_depth: int,
+        taxa_mlp_width: int,
+        esm_model_width_size: int,
+        esm_model_depth: int,
+        *,
+        key: PRNGKeyArray,
+    ):
+        key, deepgo_key, taxa_key, esm_key, cond_key, attn_key = jax.random.split(
+            key, 6
+        )
+        self.deepgo = DeepGOModel(
+            n_terms,
+            embedding_size,
+            esm_embedding_size,
+            esm_proj_width_size,
+            esm_proj_depth,
+            key=deepgo_key,
+        )
+
+        self.taxa_embeddings = eqx.nn.Embedding(
+            taxa_vocab_size,
+            taxa_embedding_size,
+            key=key,
+        )
+        self.taxa_mlp = eqx.nn.MLP(
+            taxa_embedding_size,
+            n_terms,
+            depth=taxa_mlp_depth,
+            width_size=taxa_mlp_width,
+            activation=jax.nn.gelu,
+            key=taxa_key,
+        )
+
+        self.taxa_norm = eqx.nn.LayerNorm(shape=(taxa_embedding_size))
+
+        self.esm_norm = eqx.nn.LayerNorm(esm_embedding_size)
+        self.esm_model = ESMModel(
+            esm_embedding_size,
+            n_terms,
+            esm_model_width_size,
+            esm_model_depth,
+            key=esm_key,
+        )
+        self.deepgo_weight = jnp.array(1.0)
+        self.esm_weight = jnp.array(1.0)
+        self.taxa_weight = jnp.array(1.0)
+
+        self.condition_mlp = eqx.nn.MLP(
+            in_size=1,
+            out_size=esm_embedding_size,
+            width_size=64,
+            depth=2,
+            activation=jax.nn.gelu,
+            key=cond_key,
+        )
+
+        self.dropout = eqx.nn.Dropout()
+        self.inference = False
+        # self.attn_pool = AttentionPooling(esm_embedding_size, key=attn_key)
+
+    def __call__(
+        self,
+        esm_emb: Array,
+        neighbor_prior: Float[Array, "n_terms"],
+        taxa: Int[Array, ""],
+        mask: Float[Array, "max_seq_len"],
+        condition: Float[Array, "1"],
+        key: PRNGKeyArray | None = None,
+    ):
+        esm_emb = self.dropout(esm_emb, key=key)
+        # esm_emb = self.attn_pool(esm_emb, mask)
+        cond_emb = self.condition_mlp(condition)
+        esm_emb += cond_emb
+        taxa_embeddings = self.taxa_embeddings(taxa)
+        taxa_embeddings = self.taxa_norm(taxa_embeddings)
+        taxa_logits = self.taxa_mlp(taxa_embeddings)
+
+        deepgo_logits = self.deepgo(esm_emb)
+
+        esm_emb = self.esm_norm(esm_emb)
+        esm_logits = self.esm_model(esm_emb, neighbor_prior)
+
+        return (
+            self.deepgo_weight * deepgo_logits
+            + self.esm_weight * esm_logits
+            + self.taxa_weight * taxa_logits
+        )

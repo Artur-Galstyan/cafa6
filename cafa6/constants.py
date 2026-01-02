@@ -11,7 +11,14 @@ WEIGHTS_BASE_PATH = pathlib.Path(__file__).parent.parent / "weights"
 EMBEDDINGS_PATH = DATA_BASE_PATH / "embeddings"
 
 TRAIN_FASTA_PATH = DATA_BASE_PATH / "train/train_sequences.fasta"
+TRAIN_FASTA_UNIPROT_PATH = DATA_BASE_PATH / "train/train_sequences_uniprot.fasta"
+TRAIN_FASTA_EXTENDED_PATH = DATA_BASE_PATH / "train/train_sequences_extended.fasta"
+TRAIN_FASTA_EXTENDED_CORRECTED_PATH = (
+    DATA_BASE_PATH / "train/train_sequences_extended_corrected.fasta"
+)
 TRAIN_TERMS_PATH = DATA_BASE_PATH / "train/train_terms.tsv"
+TRAIN_TERMS_UNIPROT_PATH = DATA_BASE_PATH / "train/train_terms_uniprot.tsv"
+TRAIN_TERMS_EXTENDED_PATH = DATA_BASE_PATH / "train/train_terms_extended.tsv"
 OBO_PATH = DATA_BASE_PATH / "train/go-basic.obo"
 TEST_FASTA_PATH = DATA_BASE_PATH / "test/testsuperset.fasta"
 IA_PATH = DATA_BASE_PATH / "IA.tsv"

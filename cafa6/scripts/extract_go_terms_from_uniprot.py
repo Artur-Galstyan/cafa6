@@ -1,9 +1,13 @@
 import gc
 import gzip
+import re
+import sys
 from pathlib import Path
 
 import polars as pl
 from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 from loguru import logger
 from tqdm import tqdm
 
@@ -14,6 +18,12 @@ from cafa6.constants import (
     PARTIAL_SUBMISSION_PATH,
     TERM_TO_IDX_LOOKUP_PATH,
     TEST_FASTA_PATH,
+    TRAIN_FASTA_EXTENDED_PATH,
+    TRAIN_FASTA_PATH,
+    TRAIN_FASTA_UNIPROT_PATH,
+    TRAIN_TERMS_EXTENDED_PATH,
+    TRAIN_TERMS_PATH,
+    TRAIN_TERMS_UNIPROT_PATH,
 )
 
 
@@ -125,6 +135,137 @@ def get_existing_go_terms_for_testset(
     filtered_lazy.sink_csv(partial_submission_path)
 
 
+def create_extended_train_terms_from_uniprot(
+    goa_uniprot_all_gaf_path: str | Path = GOA_UNIPROT_ALL_GAF_PATH,
+    train_terms_uniprot_path: str | Path = TRAIN_TERMS_UNIPROT_PATH,
+    extended_fasta_path: str | Path = TRAIN_FASTA_UNIPROT_PATH,
+    cache: bool = True,
+):
+    if train_terms_uniprot_path and Path(train_terms_uniprot_path).exists():
+        return pl.read_csv(train_terms_uniprot_path)
+
+    test_protein_sequences = {}
+    for record in tqdm(SeqIO.parse(TEST_FASTA_PATH, "fasta"), desc="Loading Test Seqs"):
+        test_protein_sequences[record.id] = str(record.seq)
+
+    csv_buffer = []
+    found_proteins_map = {}
+    chunk_counter = 0
+
+    go_terms_df = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    valid_go_terms = set(go_terms_df["term"])
+
+    gaf_chunks_dir = Path(DATA_BASE_PATH) / "gaf_chunks"
+    gaf_chunks_dir.mkdir(exist_ok=True, parents=True)
+
+    with gzip.open(goa_uniprot_all_gaf_path, "rt") as f:
+        for line in tqdm(f, mininterval=1.0, desc="Scanning GAF"):
+            if line.startswith("!"):
+                continue
+
+            splits = line.split("\t")
+            if len(splits) < 15:
+                continue
+
+            protein_id = splits[1]
+            if protein_id not in test_protein_sequences:
+                continue
+
+            qualifier = splits[3]
+            if "NOT" in qualifier:
+                continue
+
+            go_term = splits[4]
+            if go_term not in valid_go_terms:
+                continue
+
+            aspect = splits[8]
+            taxon_raw = splits[12]
+            taxon = taxon_raw.split(":")[1] if ":" in taxon_raw else taxon_raw
+
+            csv_buffer.append(
+                {"EntryID": protein_id, "term": go_term, "aspect": aspect}
+            )
+
+            found_proteins_map[protein_id] = taxon
+
+            if len(csv_buffer) >= 1_000_000:
+                df = pl.DataFrame(csv_buffer)
+                df.write_csv(gaf_chunks_dir / f"{chunk_counter}-train-terms.csv")
+                chunk_counter += 1
+                csv_buffer = []
+
+    if csv_buffer:
+        df = pl.DataFrame(csv_buffer)
+        df.write_csv(gaf_chunks_dir / f"{chunk_counter}-train-terms.csv")
+        chunk_counter += 1
+
+    print(f"Creating extended FASTA with {len(found_proteins_map)} new proteins...")
+
+    with open(extended_fasta_path, "w") as f_out:
+        original_records = SeqIO.parse(TRAIN_FASTA_PATH, "fasta")
+        SeqIO.write(original_records, f_out, "fasta")
+
+        new_records = []
+        for protein_id, taxon in found_proteins_map.items():
+            new_records.append(
+                SeqRecord(
+                    Seq(test_protein_sequences[protein_id]),
+                    id=protein_id,
+                    description=f"OX={taxon}",
+                )
+            )
+        SeqIO.write(new_records, f_out, "fasta")
+
+    chunks = [pl.read_csv(p) for p in gaf_chunks_dir.glob("*-train-terms.csv")]
+
+    if not chunks:
+        raise ValueError("No matching data found in GAF file!")
+
+    final_df = pl.concat(chunks)
+    final_df = final_df.unique()
+
+    if cache:
+        final_df.write_csv(train_terms_uniprot_path)
+
+    return final_df
+
+
+def combine_uniprot_and_train_sets():
+    combined_records = []
+    protein_ids_set = set()
+    for record in SeqIO.parse(TRAIN_FASTA_UNIPROT_PATH, "fasta"):
+        protein_id = record.id if "|" not in record.id else record.id.split("|")[1]
+        if protein_id in protein_ids_set:
+            continue
+        protein_ids_set.add(protein_id)
+        description = record.description
+        match = re.search(r"(?<=OX=)\d+", description)
+        taxon = int(match.group(0)) if match else 9606
+
+        combined_records.append(
+            SeqRecord(
+                Seq(record.seq),
+                id=protein_id,
+                description=f"OX={taxon}",
+            )
+        )
+    with open(TRAIN_FASTA_EXTENDED_PATH, "w") as f_out:
+        SeqIO.write(combined_records, f_out, "fasta")
+
+    train_terms = pl.read_csv(TRAIN_TERMS_PATH, separator="\t")
+    train_terms_extended = pl.read_csv(TRAIN_TERMS_UNIPROT_PATH)
+
+    train_terms_diff = train_terms_extended.join(
+        train_terms, on=["EntryID", "term"], how="anti"
+    )
+
+    combined_df = pl.concat([train_terms, train_terms_diff])
+    combined_df.write_csv(TRAIN_TERMS_EXTENDED_PATH, separator="\t")
+
+
 if __name__ == "__main__":
+    # create_extended_train_terms_from_uniprot()
     # extract_go_terms_from_uniprot()
-    get_existing_go_terms_for_testset()
+    # get_existing_go_terms_for_testset()
+    combine_uniprot_and_train_sets()
