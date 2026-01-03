@@ -95,10 +95,10 @@ def _evaluate_scores(
 
 
 @eqx.filter_jit
-def _get_preds(_model, _e, _n, _t, _m, _c):
+def _get_preds(_model, _e, _n, _tn, _t, _m, _c):
     print("_get_preds JIT")
-    logits = eqx.filter_vmap(_model, in_axes=(0, 0, 0, 0, None, None))(
-        _e, _n, _t, _m, _c, None
+    logits = eqx.filter_vmap(_model, in_axes=(0, 0, 0, 0, 0, None, None))(
+        _e, _n, _tn, _t, _m, _c, None
     )
     preds = jax.nn.sigmoid(logits)
     return preds
@@ -113,17 +113,24 @@ def evaluate(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
     cond_array = jnp.array([condition_val])
 
     for batch in val_data_loader:
-        idx, esm_emb, neighbor_prior, taxon, mask, y = batch
-        esm_emb, neighbor_prior, taxon, mask, y = (
+        idx, esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = batch
+        esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = (
             jnp.array(esm_emb),
             jnp.array(neighbor_prior),
+            jnp.array(text_neighbor_priors),
             jnp.array(taxon),
             jnp.array(mask),
             jnp.array(y),
         )
 
         preds = _get_preds(
-            inference_model, esm_emb, neighbor_prior, taxon, mask, cond_array
+            inference_model,
+            esm_emb,
+            neighbor_prior,
+            text_neighbor_priors,
+            taxon,
+            mask,
+            cond_array,
         )
 
         all_preds.append(preds)

@@ -35,10 +35,10 @@ from cafa6.utils import get_graph_edges
 
 
 class TrainConfig(BaseModel):
-    batch_size: int = 256
-    learning_rate: float = 0.0005
-    num_epochs: int = 100
-    worker_count: int = 4
+    batch_size: int = 512
+    learning_rate: float = 0.0007
+    num_epochs: int = 20
+    worker_count: int = 16
     patience: int = 10
 
     knn: int = 6
@@ -47,21 +47,26 @@ class TrainConfig(BaseModel):
     esm_model: str = "esmc_600m"
     esm_strategy: Literal["raw", "mean"] = "mean"
 
-    deepgo_se_embedding_size: int = 1024
+    deepgo_se_embedding_size: int = 2048
 
     esm_proj_width_size: int = 2048
-    esm_proj_depth: int = 2
+    esm_proj_depth: int = 3
 
     taxa_embedding_size: int = 1024
     taxa_vocab_size: int = 8500
-    taxa_mlp_depth: int = 2
+    taxa_mlp_depth: int = 3
     taxa_mlp_width: int = 1024
 
     esm_model_width_size: int = 2048
-    esm_model_depth: int = 2
+    esm_model_depth: int = 3
 
-    warmup_steps: int = 500
+    warmup_steps: int = 400
     ratio: float = 0.2
+
+    text_embedding_size: int = 1024  # voyage embs, don't change!
+    text_embedding_hidden_size: int = 512
+    text_embedding_mlp_width: int = 1024
+    text_embedding_mlp_depth: int = 2
 
 
 def _setup_mlflow():
@@ -99,16 +104,16 @@ def focal_weight(probs, labels, gamma=2.0):
     return focal_weight
 
 
-# def hierarchy_consistency_loss(probs, ontology_graph):
-#     child_idx = ontology_graph[:, 0]
-#     parent_idx = ontology_graph[:, 1]
+def hierarchy_consistency_loss(probs, ontology_graph):
+    child_idx = ontology_graph[:, 0]
+    parent_idx = ontology_graph[:, 1]
 
-#     child_probs = probs[:, child_idx]
-#     parent_probs = probs[:, parent_idx]
+    child_probs = probs[:, child_idx]
+    parent_probs = probs[:, parent_idx]
 
-#     # Child should never be > parent
-#     violation = jax.nn.relu(child_probs - parent_probs)
-#     return violation.mean()
+    # Child should never be > parent
+    violation = jax.nn.relu(child_probs - parent_probs)
+    return violation.mean()
 
 
 def loss_fn(
@@ -120,7 +125,6 @@ def loss_fn(
     ontology_graph: Int[Array, "n_edges 2"],
     key: PRNGKeyArray,
 ):
-    esm_emb, neighbor_prior, taxa, mask = X
     keys = jax.random.split(key, len(labels))
     logits = eqx.filter_vmap(model)(*X, sampled_weight, keys)
     probs = jax.nn.sigmoid(logits)
@@ -140,9 +144,9 @@ def loss_fn(
         ontology_graph,
     )
 
-    focal_loss = focal_weight(probs, labels) * per_term_loss
+    hierarchy_loss_value = hierarchy_consistency_loss(probs, ontology_graph)
 
-    return base_loss + axiom_loss_value + jnp.mean(focal_loss)
+    return base_loss + axiom_loss_value + 0.3 * hierarchy_loss_value
 
 
 @eqx.filter_jit
@@ -204,6 +208,10 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
         "taxa_mlp_width": train_config.taxa_mlp_width,
         "esm_model_width_size": train_config.esm_model_width_size,
         "esm_model_depth": train_config.esm_model_depth,
+        "text_embedding_size": train_config.text_embedding_size,
+        "text_embedding_hidden_size": train_config.text_embedding_hidden_size,
+        "text_embedding_mlp_width": train_config.text_embedding_mlp_width,
+        "text_embedding_mlp_depth": train_config.text_embedding_mlp_depth,
     }
     model = Model(
         **model_config,
@@ -250,20 +258,19 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
         epoch = 0
         epoch_loss = 0.0
 
-        steps_per_epoch = (
-            int(n_total * (1 - train_config.ratio)) // train_config.batch_size
-        )
+        steps_per_epoch = n_total // train_config.batch_size
         total_steps = steps_per_epoch * train_config.num_epochs
 
         for step, batch in tqdm(
             enumerate(train_data_loader),
-            total=(n_total * (1 - train_config.ratio)) // train_config.batch_size,
+            total=(n_total // train_config.batch_size),
         ):
             key, subkey = jax.random.split(key)
-            idx, esm_emb, neighbor_prior, taxon, mask, y = batch
-            esm_emb, neighbor_prior, taxon, mask, y = (
+            idx, esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = batch
+            esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = (
                 jnp.array(esm_emb),
                 jnp.array(neighbor_prior),
+                jnp.array(text_neighbor_priors),
                 jnp.array(taxon),
                 jnp.array(mask),
                 jnp.array(y),
@@ -271,7 +278,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
 
             model, opt_state, loss = step_fn(
                 model,
-                (esm_emb, neighbor_prior, taxon, mask),
+                (esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask),
                 y,
                 optimizer,
                 opt_state,

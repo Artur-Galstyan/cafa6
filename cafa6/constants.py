@@ -4,11 +4,37 @@ MODEL_TO_DIMS: dict[str, int] = {
     "esmc_600m": 1152,
 }
 
+TEXT_EMBEDDING_SIZE = 1024
+
 ESM_MODEL = "esmc_600m"
 
 DATA_BASE_PATH = pathlib.Path(__file__).parent.parent / "data"
 WEIGHTS_BASE_PATH = pathlib.Path(__file__).parent.parent / "weights"
 EMBEDDINGS_PATH = DATA_BASE_PATH / "embeddings"
+
+TEXT_EMBEDDINGS_PATH_TRAIN = EMBEDDINGS_PATH / "train" / "text"
+TEXT_EMBEDDINGS_PATH_TEST = EMBEDDINGS_PATH / "test" / "text"
+
+TEXT_EMBEDDINGS_TRAIN_NEIGHBOR_MATRIX_PATH = (
+    DATA_BASE_PATH / "text_neighbor_matrix_train.npy"
+)
+TEXT_EMBEDDINGS_TRAIN_NEIGHBOR_IDX_PATH = (
+    DATA_BASE_PATH / "text_neighbor_matrix_train_idx.npy"
+)
+
+
+TEXT_EMBEDDINGS_TEST_NEIGHBOR_MATRIX_PATH = (
+    DATA_BASE_PATH / "text_neighbor_matrix_test.npy"
+)
+TEXT_EMBEDDINGS_TEST_NEIGHBOR_IDX_PATH = (
+    DATA_BASE_PATH / "text_neighbor_matrix_test_idx.npy"
+)
+
+TRAIN_PROTEIN_RAW_DESCRIPTIONS = DATA_BASE_PATH / "train_protein_raw_descriptions.csv"
+TRAIN_PROTEIN_RAW_DESCRIPTIONS_RICH = (
+    DATA_BASE_PATH / "train_protein_raw_descriptions_rich.csv"
+)
+
 
 TRAIN_FASTA_PATH = DATA_BASE_PATH / "train/train_sequences.fasta"
 TRAIN_FASTA_UNIPROT_PATH = DATA_BASE_PATH / "train/train_sequences_uniprot.fasta"
