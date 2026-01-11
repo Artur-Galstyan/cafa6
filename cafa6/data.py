@@ -20,6 +20,10 @@ from cafa6.constants import (
     ESM_MODEL,
     IA_PATH,
     MODEL_TO_DIMS,
+    TEA_TEST_NEIGHBOR_IDX_MAP_PATH,
+    TEA_TEST_NEIGHBOR_MATRIX_PATH,
+    TEA_TRAIN_NEIGHBOR_IDX_MAP_PATH,
+    TEA_TRAIN_NEIGHBOR_MATRIX_PATH,
     TEST_FASTA_PATH,
     TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH,
     TEST_NEIGHBOR_MATRIX_PATH,
@@ -31,9 +35,17 @@ from cafa6.constants import (
     TEXT_EMBEDDINGS_TRAIN_NEIGHBOR_MATRIX_PATH,
     TRAIN_FASTA_EXTENDED_CORRECTED_PATH,
     TRAIN_FASTA_PATH,
+    TRAIN_FASTA_PATH_SPLIT,
     TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH,
     TRAIN_NEIGHBOR_MATRIX_PATH,
     TRAIN_TERMS_EXTENDED_PATH,
+    VAL_FASTA_PATH_SPLIT,
+    VAL_NEIGHBOR_MATRIX_IDX_MAP_PATH,
+    VAL_NEIGHBOR_MATRIX_PATH,
+    VAL_TEA_NEIGHBOR_IDX_MAP_PATH,
+    VAL_TEA_NEIGHBOR_MATRIX_PATH,
+    VAL_TEXT_NEIGHBOR_IDX_MAP_PATH,
+    VAL_TEXT_NEIGHBOR_MATRIX_PATH,
 )
 
 _SHARED_PRIORS = None
@@ -88,6 +100,7 @@ def get_test_loader(batch_size: int = 128, worker_count: int = 4):
 
     transformations = [
         TestMapToArrayAndEmbeddings(
+            len(ia_df),
             str(TEST_NEIGHBOR_MATRIX_PATH),
             str(TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH),
             str(TEXT_EMBEDDINGS_TEST_NEIGHBOR_MATRIX_PATH),
@@ -166,11 +179,13 @@ class DataSource(RandomAccessDataSource):
 
 _SHARED_TEST_PRIORS = None
 _SHARED_TEST_TEXT_PRIORS = None
+_SHARED_TEST_TEA_PRIORS = None
 
 
 class TestMapToArrayAndEmbeddings(Map):
     def __init__(
         self,
+        n_terms: int,
         neighbor_priors_path: str,
         neighbor_priors_idx_map_path: str,
         text_neighbor_priors_path: str,
@@ -180,6 +195,8 @@ class TestMapToArrayAndEmbeddings(Map):
         esm_strategy: Literal["mean", "raw"] = "mean",
         embedding_base_path: str | Path = EMBEDDINGS_PATH,
         taxon_lookup_path: str | Path = TEST_SUPERSET_TAXON_LOOKUP_PATH,
+        tea_neighbor_priors_path: str | Path = TEA_TEST_NEIGHBOR_MATRIX_PATH,
+        tea_neighbor_priors_idx_map_path: str | Path = TEA_TEST_NEIGHBOR_IDX_MAP_PATH,
     ):
         self.neighbor_priors_path = neighbor_priors_path
         self.neighbor_priors_idx_map_path = neighbor_priors_idx_map_path
@@ -202,9 +219,14 @@ class TestMapToArrayAndEmbeddings(Map):
         self.esm_model = esm_model
         self.max_protein_seq = max_protein_seq
         self.esm_strategy = esm_strategy
+        self.n_terms = n_terms
+
+        self.tea_neighbor_priors_path = tea_neighbor_priors_path
+        with open(tea_neighbor_priors_idx_map_path, "rb") as f:
+            self.tea_pid_to_prior_idx = pickle.load(f)
 
     def map(self, element: tuple[str, list[str], int]):
-        global _SHARED_TEST_PRIORS, _SHARED_TEST_TEXT_PRIORS
+        global _SHARED_TEST_PRIORS, _SHARED_TEST_TEXT_PRIORS, _SHARED_TEST_TEA_PRIORS
 
         if _SHARED_TEST_PRIORS is None:
             _SHARED_TEST_PRIORS = np.load(self.neighbor_priors_path, mmap_mode="r")
@@ -254,11 +276,23 @@ class TestMapToArrayAndEmbeddings(Map):
         else:
             text_neighbor_prior = np.zeros(TEXT_EMBEDDING_SIZE, dtype=np.float32)
 
+        if _SHARED_TEST_TEA_PRIORS is None:
+            _SHARED_TEST_TEA_PRIORS = np.load(
+                self.tea_neighbor_priors_path, mmap_mode="r"
+            )
+
+        tea_prior_idx = self.tea_pid_to_prior_idx.get(protein_id)
+        if tea_prior_idx is not None:
+            tea_neighbor_prior = _SHARED_TEST_TEA_PRIORS[tea_prior_idx]
+        else:
+            tea_neighbor_prior = np.zeros(self.n_terms, dtype=np.float32)
+
         return (
             protein_id,
             embeddings_esm,
             neighbor_prior,
             text_neighbor_prior,
+            tea_neighbor_prior,
             self.taxon_to_idx[taxon],
             mask,
         )
@@ -269,7 +303,20 @@ def get_datasources(
     train_terms_path=TRAIN_TERMS_EXTENDED_PATH,
     original_fasta_path=TRAIN_FASTA_PATH,
     ratio=0.1,
+    val_from_original_only=False,
 ):
+    """
+    Create train/val splits with balanced distribution.
+
+    Args:
+        train_fasta_path: Path to extended training FASTA
+        train_terms_path: Path to extended training terms
+        original_fasta_path: Path to original CAFA training FASTA
+        ratio: Fraction of data to use for validation
+        val_from_original_only: If True, validation only uses original proteins
+                                (old behavior). If False, both train and val
+                                get proportional splits of original AND extended.
+    """
     original_ids = set()
     for record in SeqIO.parse(original_fasta_path, "fasta"):
         pid = record.id.split("|")[1] if "|" in record.id else record.id
@@ -281,14 +328,39 @@ def get_datasources(
         all_proteins.append(pid)
 
     original_indices = [i for i, pid in enumerate(all_proteins) if pid in original_ids]
-    new_indices = [i for i, pid in enumerate(all_proteins) if pid not in original_ids]
+    extended_indices = [
+        i for i, pid in enumerate(all_proteins) if pid not in original_ids
+    ]
 
     random.seed(42)
-    random.shuffle(original_indices)
-    val_size = int(len(original_indices) * ratio)
-    val_indices = original_indices[:val_size]
 
-    train_indices = original_indices[val_size:] + new_indices
+    if val_from_original_only:
+        # Old behavior: validation only from original proteins
+        random.shuffle(original_indices)
+        val_size = int(len(original_indices) * ratio)
+        val_indices = original_indices[:val_size]
+        train_indices = original_indices[val_size:] + extended_indices
+    else:
+        # New behavior: proportional split of both original and extended
+        random.shuffle(original_indices)
+        random.shuffle(extended_indices)
+
+        # Split original proteins
+        val_size_original = int(len(original_indices) * ratio)
+        val_original = original_indices[:val_size_original]
+        train_original = original_indices[val_size_original:]
+
+        # Split extended proteins with same ratio
+        val_size_extended = int(len(extended_indices) * ratio)
+        val_extended = extended_indices[:val_size_extended]
+        train_extended = extended_indices[val_size_extended:]
+
+        val_indices = val_original + val_extended
+        train_indices = train_original + train_extended
+
+        # Shuffle to mix original and extended
+        random.shuffle(val_indices)
+        random.shuffle(train_indices)
 
     train_data_source = DataSource(
         str(train_fasta_path), str(train_terms_path), train_indices
@@ -302,6 +374,12 @@ def get_datasources(
 
 _SHARED_EMBEDDINGS = None
 _SHARED_EMBEDDINGS_IDX = None
+_SHARED_TEA_PRIORS = None
+
+# Separate globals for validation priors (to avoid mixing with train priors)
+_SHARED_VAL_PRIORS = None
+_SHARED_VAL_TEXT_PRIORS = None
+_SHARED_VAL_TEA_PRIORS = None
 
 
 class MapTermsToArrayAndEmbeddings(Map):
@@ -319,6 +397,8 @@ class MapTermsToArrayAndEmbeddings(Map):
         taxon_lookup_path: str | Path = TEST_SUPERSET_TAXON_LOOKUP_PATH,
         consolidated_emb_path: str | Path | None = None,
         consolidated_idx_path: str | Path | None = None,
+        tea_neighbor_priors_path: str | Path = TEA_TRAIN_NEIGHBOR_MATRIX_PATH,
+        tea_neighbor_priors_idx_map_path: str | Path = TEA_TRAIN_NEIGHBOR_IDX_MAP_PATH,
     ):
         self.terms_to_idx_weight = terms_to_idx_weight
         self.neighbor_priors_path = neighbor_priors_path
@@ -348,13 +428,18 @@ class MapTermsToArrayAndEmbeddings(Map):
         self.max_protein_seq = max_protein_seq
         self.esm_strategy = esm_strategy
 
+        self.tea_neighbor_priors_path = tea_neighbor_priors_path
+        with open(tea_neighbor_priors_idx_map_path, "rb") as f:
+            self.tea_pid_to_prior_idx = pickle.load(f)
+
     def map(self, element: tuple[str, str, list[str], int]):
         assert self.consolidated_idx_path is not None
         global \
             _SHARED_PRIORS, \
             _SHARED_EMBEDDINGS, \
             _SHARED_EMBEDDINGS_IDX, \
-            _SHARED_TEXT_PRIORS
+            _SHARED_TEXT_PRIORS, \
+            _SHARED_TEA_PRIORS
 
         if _SHARED_PRIORS is None:
             _SHARED_PRIORS = np.load(self.neighbor_priors_path, mmap_mode="r")
@@ -418,11 +503,177 @@ class MapTermsToArrayAndEmbeddings(Map):
         else:
             text_neighbor_prior = np.zeros(TEXT_EMBEDDING_SIZE, dtype=np.float32)
 
+        if _SHARED_TEA_PRIORS is None:
+            _SHARED_TEA_PRIORS = np.load(self.tea_neighbor_priors_path, mmap_mode="r")
+
+        tea_prior_idx = self.tea_pid_to_prior_idx.get(protein_id)
+        if tea_prior_idx is not None:
+            tea_neighbor_prior = _SHARED_TEA_PRIORS[tea_prior_idx]
+        else:
+            tea_neighbor_prior = np.zeros(
+                len(self.terms_to_idx_weight), dtype=np.float32
+            )
+
         return (
             protein_id,
             embeddings_esm,
             neighbor_prior,
             text_neighbor_prior,
+            tea_neighbor_prior,
+            self.taxon_to_idx[taxon],
+            mask,
+            labels,
+        )
+
+
+class ValMapTermsToArrayAndEmbeddings(Map):
+    """
+    Validation-specific mapper that uses val priors (computed using only train as neighbors).
+    This ensures validation mimics test-time conditions with no data leakage.
+    """
+
+    def __init__(
+        self,
+        terms_to_idx_weight: dict,
+        neighbor_priors_path: str,
+        neighbor_priors_idx_map_path: str,
+        text_neighbor_priors_path: str,
+        text_neighbor_priors_idx_map_path: str,
+        esm_model: str,
+        max_protein_seq: int = 1024,
+        esm_strategy: Literal["mean", "raw"] = "mean",
+        embedding_base_path: str | Path = EMBEDDINGS_PATH,
+        taxon_lookup_path: str | Path = TEST_SUPERSET_TAXON_LOOKUP_PATH,
+        consolidated_emb_path: str | Path | None = None,
+        consolidated_idx_path: str | Path | None = None,
+        tea_neighbor_priors_path: str | Path = VAL_TEA_NEIGHBOR_MATRIX_PATH,
+        tea_neighbor_priors_idx_map_path: str | Path = VAL_TEA_NEIGHBOR_IDX_MAP_PATH,
+    ):
+        self.terms_to_idx_weight = terms_to_idx_weight
+        self.neighbor_priors_path = neighbor_priors_path
+        self.neighbor_priors_idx_map_path = neighbor_priors_idx_map_path
+
+        self.text_neighbor_priors_path = text_neighbor_priors_path
+        self.text_neighbor_priors_idx_map_path = text_neighbor_priors_idx_map_path
+
+        self.taxon_lookup_path = taxon_lookup_path
+
+        self.consolidated_emb_path = consolidated_emb_path
+        self.consolidated_idx_path = consolidated_idx_path
+
+        with open(neighbor_priors_idx_map_path, "rb") as f:
+            self.pid_to_prior_idx = pickle.load(f)
+
+        with open(text_neighbor_priors_idx_map_path, "rb") as f:
+            self.text_pid_to_prior_idx = pickle.load(f)
+
+        self.taxon_to_idx = {}
+        taxon_idx_df = pl.read_csv(self.taxon_lookup_path)
+        for row in taxon_idx_df.iter_rows(named=True):
+            self.taxon_to_idx[row["ID"]] = row["idx"]
+
+        self.embedding_base_path = Path(embedding_base_path)
+        self.esm_model = esm_model
+        self.max_protein_seq = max_protein_seq
+        self.esm_strategy = esm_strategy
+
+        self.tea_neighbor_priors_path = tea_neighbor_priors_path
+        with open(tea_neighbor_priors_idx_map_path, "rb") as f:
+            self.tea_pid_to_prior_idx = pickle.load(f)
+
+    def map(self, element: tuple[str, str, list[str], int]):
+        assert self.consolidated_idx_path is not None
+        global \
+            _SHARED_VAL_PRIORS, \
+            _SHARED_EMBEDDINGS, \
+            _SHARED_EMBEDDINGS_IDX, \
+            _SHARED_VAL_TEXT_PRIORS, \
+            _SHARED_VAL_TEA_PRIORS
+
+        # Use validation-specific priors
+        if _SHARED_VAL_PRIORS is None:
+            _SHARED_VAL_PRIORS = np.load(self.neighbor_priors_path, mmap_mode="r")
+
+        if _SHARED_VAL_TEXT_PRIORS is None:
+            _SHARED_VAL_TEXT_PRIORS = np.load(
+                self.text_neighbor_priors_path, mmap_mode="r"
+            )
+
+        if self.consolidated_emb_path and _SHARED_EMBEDDINGS is None:
+            _SHARED_EMBEDDINGS = np.load(self.consolidated_emb_path, mmap_mode="r")
+            with open(self.consolidated_idx_path, "rb") as f:
+                _SHARED_EMBEDDINGS_IDX = pickle.load(f)
+
+        assert _SHARED_EMBEDDINGS_IDX is not None
+
+        protein_id, sequence, terms, taxon = element
+        indices = np.array([self.terms_to_idx_weight[t][0] for t in terms])
+
+        labels = np.zeros(len(self.terms_to_idx_weight), dtype=np.float32)
+        labels[indices] = 1.0
+
+        if _SHARED_EMBEDDINGS is not None and protein_id in _SHARED_EMBEDDINGS_IDX:
+            emb_idx = _SHARED_EMBEDDINGS_IDX[protein_id]
+            embeddings_esm = _SHARED_EMBEDDINGS[emb_idx]
+            mask = np.zeros((self.max_protein_seq,), dtype=np.float32)
+        else:
+            # fallback
+            esm_path = (
+                self.embedding_base_path
+                / "train"
+                / self.esm_model
+                / self.esm_strategy
+                / f"{protein_id}.npy"
+            )
+            embeddings_esm = np.zeros(
+                shape=(self.max_protein_seq, MODEL_TO_DIMS[self.esm_model])
+            )
+            mask = np.zeros((self.max_protein_seq,), dtype=np.float32)
+
+            if esm_path.exists():
+                embeddings_esm_non_trunc = np.load(str(esm_path))
+                if self.esm_strategy == "raw":
+                    seq_len, _ = embeddings_esm_non_trunc.shape
+                    lens = min(self.max_protein_seq, seq_len)
+                    embeddings_esm[:lens] = embeddings_esm_non_trunc[:lens]
+                    mask[:lens] = 1.0
+                elif self.esm_strategy == "mean":
+                    embeddings_esm = embeddings_esm_non_trunc
+            else:
+                raise FileNotFoundError(f"{esm_path} not found!")
+
+        prior_idx = self.pid_to_prior_idx.get(protein_id)
+        if prior_idx is not None:
+            neighbor_prior = _SHARED_VAL_PRIORS[prior_idx]
+        else:
+            neighbor_prior = np.zeros(len(self.terms_to_idx_weight), dtype=np.float32)
+
+        text_prior_idx = self.text_pid_to_prior_idx.get(protein_id)
+
+        if text_prior_idx is not None:
+            text_neighbor_prior = _SHARED_VAL_TEXT_PRIORS[text_prior_idx]
+        else:
+            text_neighbor_prior = np.zeros(TEXT_EMBEDDING_SIZE, dtype=np.float32)
+
+        if _SHARED_VAL_TEA_PRIORS is None:
+            _SHARED_VAL_TEA_PRIORS = np.load(
+                self.tea_neighbor_priors_path, mmap_mode="r"
+            )
+
+        tea_prior_idx = self.tea_pid_to_prior_idx.get(protein_id)
+        if tea_prior_idx is not None:
+            tea_neighbor_prior = _SHARED_VAL_TEA_PRIORS[tea_prior_idx]
+        else:
+            tea_neighbor_prior = np.zeros(
+                len(self.terms_to_idx_weight), dtype=np.float32
+            )
+
+        return (
+            protein_id,
+            embeddings_esm,
+            neighbor_prior,
+            text_neighbor_prior,
+            tea_neighbor_prior,
             self.taxon_to_idx[taxon],
             mask,
             labels,
@@ -430,6 +681,7 @@ class MapTermsToArrayAndEmbeddings(Map):
 
 
 def get_transformations(batch_size: int = 128, drop_remainder=True):
+    """Get transformations for TRAINING data."""
     terms_to_idx_weight = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
     for i, row in enumerate(ia_df.iter_rows(named=True)):
@@ -440,8 +692,8 @@ def get_transformations(batch_size: int = 128, drop_remainder=True):
             terms_to_idx_weight,
             str(TRAIN_NEIGHBOR_MATRIX_PATH),
             str(TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH),
-            str(TEXT_EMBEDDINGS_TRAIN_NEIGHBOR_MATRIX_PATH),  # ADD THIS
-            str(TEXT_EMBEDDINGS_TRAIN_NEIGHBOR_IDX_PATH),  # ADD THIS
+            str(TEXT_EMBEDDINGS_TRAIN_NEIGHBOR_MATRIX_PATH),
+            str(TEXT_EMBEDDINGS_TRAIN_NEIGHBOR_IDX_PATH),
             ESM_MODEL,
             consolidated_emb_path=str(
                 DATA_BASE_PATH / f"embeddings_train_{ESM_MODEL}_mean.npy"
@@ -453,6 +705,53 @@ def get_transformations(batch_size: int = 128, drop_remainder=True):
         Batch(batch_size=batch_size, drop_remainder=drop_remainder),
     ]
     return transformations
+
+
+def get_val_transformations(batch_size: int = 128, drop_remainder=True):
+    """
+    Get transformations for VALIDATION data.
+    Uses val-specific priors that were computed using only train proteins as neighbors.
+    """
+    terms_to_idx_weight = {}
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    for i, row in enumerate(ia_df.iter_rows(named=True)):
+        terms_to_idx_weight[row["term"]] = (i, row["weight"])
+
+    transformations = [
+        ValMapTermsToArrayAndEmbeddings(
+            terms_to_idx_weight,
+            str(VAL_NEIGHBOR_MATRIX_PATH),
+            str(VAL_NEIGHBOR_MATRIX_IDX_MAP_PATH),
+            str(VAL_TEXT_NEIGHBOR_MATRIX_PATH),
+            str(VAL_TEXT_NEIGHBOR_IDX_MAP_PATH),
+            ESM_MODEL,
+            consolidated_emb_path=str(
+                DATA_BASE_PATH / f"embeddings_train_{ESM_MODEL}_mean.npy"
+            ),
+            consolidated_idx_path=str(
+                DATA_BASE_PATH / f"embeddings_train_{ESM_MODEL}_mean_idx.pkl"
+            ),
+            tea_neighbor_priors_path=str(VAL_TEA_NEIGHBOR_MATRIX_PATH),
+            tea_neighbor_priors_idx_map_path=str(VAL_TEA_NEIGHBOR_IDX_MAP_PATH),
+        ),
+        Batch(batch_size=batch_size, drop_remainder=drop_remainder),
+    ]
+    return transformations
+
+
+def get_split_datasources(
+    train_fasta_path=TRAIN_FASTA_PATH_SPLIT,
+    val_fasta_path=VAL_FASTA_PATH_SPLIT,
+    train_terms_path=TRAIN_TERMS_EXTENDED_PATH,
+):
+    """
+    Load train/val data from pre-split FASTA files.
+    Use this with the split-aware neighbor priors for proper validation.
+    """
+    train_data_source = DataSource(str(train_fasta_path), str(train_terms_path))
+    val_data_source = DataSource(str(val_fasta_path), str(train_terms_path))
+
+    return train_data_source, val_data_source, len(train_data_source)
 
 
 def create_train_loader(

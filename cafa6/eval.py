@@ -5,13 +5,19 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import polars as pl
+from cafaeval.evaluation import cafa_score_dfs
 from jaxtyping import Array
 
 from cafa6.constants import (
+    IA_PATH,
+    IA_PATH_NO_HEAD,
+    OBO_PATH,
     TERM_TO_ASPECT_PATH,
     TERM_TO_IDX_LOOKUP_PATH,
+    TRAIN_TERMS_EXTENDED_PATH,
     TRAIN_TERMS_PATH,
 )
+from cafa6.scripts.create_submission import create_submission
 from cafa6.utils import get_go_term_weights
 
 
@@ -95,58 +101,124 @@ def _evaluate_scores(
 
 
 @eqx.filter_jit
-def _get_preds(_model, _e, _n, _tn, _t, _m, _c):
-    print("_get_preds JIT")
-    logits = eqx.filter_vmap(_model, in_axes=(0, 0, 0, 0, 0, None, None))(
-        _e, _n, _tn, _t, _m, _c, None
+def _get_preds(
+    model,
+    embeddings_esm,
+    neighbor_priors,
+    text_neighbor_priors,
+    tea_neighbor_priors,
+    taxons,
+    masks,
+    condition,
+):
+    preds = eqx.filter_vmap(model, in_axes=(0, 0, 0, 0, 0, 0, None, None))(
+        embeddings_esm,
+        neighbor_priors,
+        text_neighbor_priors,
+        tea_neighbor_priors,
+        taxons,
+        masks,
+        condition,
+        None,
     )
-    preds = jax.nn.sigmoid(logits)
+    preds = jax.nn.sigmoid(preds)
     return preds
 
 
-def evaluate(model, val_data_loader, condition_val: Array = jnp.array(30.0)):
-    all_preds = []
-    all_labels = []
+def evaluate(
+    model,
+    val_data_loader,
+    condition_val: Array = jnp.array(30.0),
+):
+    print("Creating submission")
+    submission = create_submission(
+        model=model,
+        data_loader=val_data_loader,
+        worker_count=1,
+        preds_per_term=50,
+        include_partial=False,
+    )
+    submission = submission.rename(
+        {"EntryID": "protein_id", "term": "term_id", "value": "score"}
+    )
 
-    inference_model = eqx.nn.inference_mode(model)
+    val_protein_ids = submission["protein_id"].unique().to_list()
 
-    cond_array = jnp.array([condition_val])
+    # Load ground truth and filter to ONLY validation proteins
+    gt_df = pl.read_csv(TRAIN_TERMS_EXTENDED_PATH, separator="\t")
+    gt_df = gt_df.rename({"EntryID": "protein_id", "term": "term_id"})
+    gt_df = gt_df.filter(pl.col("protein_id").is_in(val_protein_ids))
 
-    for batch in val_data_loader:
-        idx, esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = batch
-        esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = (
-            jnp.array(esm_emb),
-            jnp.array(neighbor_prior),
-            jnp.array(text_neighbor_priors),
-            jnp.array(taxon),
-            jnp.array(mask),
-            jnp.array(y),
-        )
+    score = cafa_score_dfs(
+        OBO_PATH,
+        submission,
+        gt_df,
+        IA_PATH_NO_HEAD,
+    )
 
-        preds = _get_preds(
-            inference_model,
-            esm_emb,
-            neighbor_prior,
-            text_neighbor_priors,
-            taxon,
-            mask,
-            cond_array,
-        )
+    return score
 
-        all_preds.append(preds)
-        all_labels.append(y)
+    # all_preds = []
+    # all_labels = []
 
-    all_preds = jnp.concatenate(all_preds, axis=0)
-    all_labels = jnp.concatenate(all_labels, axis=0)
+    # inference_model = eqx.nn.inference_mode(model)
 
-    weights = jnp.array(get_go_term_weights())
-    term_to_aspect = build_term_to_aspect()
-    if not TERM_TO_IDX_LOOKUP_PATH.exists():
-        raise FileNotFoundError(
-            f"{TERM_TO_IDX_LOOKUP_PATH} not found. Run scripts/cafa6_terms_to_idx.py"
-        )
-    term_to_idx_weight = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
-    term_to_idx = dict(zip(term_to_idx_weight["term"], term_to_idx_weight["index"]))
-    aspect_masks = build_aspect_masks(term_to_idx, term_to_aspect)
+    # cond_array = jnp.array([condition_val])
 
-    return _evaluate_scores(all_preds, all_labels, weights, aspect_masks)
+    # for batch in val_data_loader:
+    #     (
+    #         idx,
+    #         esm_emb,
+    #         neighbor_prior,
+    #         text_neighbor_priors,
+    #         tea_neighbor_priors,
+    #         taxon,
+    #         mask,
+    #         y,
+    #     ) = batch
+    #     (
+    #         esm_emb,
+    #         neighbor_prior,
+    #         text_neighbor_priors,
+    #         tea_neighbor_priors,
+    #         taxon,
+    #         mask,
+    #         y,
+    #     ) = (
+    #         jnp.array(esm_emb),
+    #         jnp.array(neighbor_prior),
+    #         jnp.array(text_neighbor_priors),
+    #         jnp.array(tea_neighbor_priors),
+    #         jnp.array(taxon),
+    #         jnp.array(mask),
+    #         jnp.array(y),
+    #     )
+
+    #     preds = _get_preds(
+    #         inference_model,
+    #         esm_emb,
+    #         neighbor_prior,
+    #         text_neighbor_priors,
+    #         tea_neighbor_priors,
+    #         taxon,
+    #         mask,
+    #         cond_array,
+    #     )
+
+    #     all_preds.append(preds)
+    #     all_labels.append(y)
+
+    # all_preds = jnp.concatenate(all_preds, axis=0)
+    # all_labels = jnp.concatenate(all_labels, axis=0)
+
+    # weights = jnp.array(get_go_term_weights())
+    # term_to_aspect = build_term_to_aspect()
+    # if not TERM_TO_IDX_LOOKUP_PATH.exists():
+    #     raise FileNotFoundError(
+    #         f"{TERM_TO_IDX_LOOKUP_PATH} not found. Run scripts/cafa6_terms_to_idx.py"
+    #     )
+    # term_to_idx_weight = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    # term_to_idx = dict(zip(term_to_idx_weight["term"], term_to_idx_weight["index"]))
+    # aspect_masks = build_aspect_masks(term_to_idx, term_to_aspect)
+
+    # return _evaluate_scores(all_preds, all_labels, weights, aspect_masks)

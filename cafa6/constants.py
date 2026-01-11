@@ -74,3 +74,27 @@ TRAIN_NEIGHBOR_MATRIX_IDX_MAP_PATH = (
 TEST_NEIGHBOR_MATRIX_IDX_MAP_PATH = (
     DATA_BASE_PATH / "neighbor_matrix_path_test_idx_map.pkl"
 )
+
+TRAIN_TEA_PATH = DATA_BASE_PATH / "train" / "train_tea.fasta"
+TEST_TEA_PATH = DATA_BASE_PATH / "test" / "test_tea.fasta"
+
+TEA_TRAIN_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "tea_neighbor_matrix_train.npy"
+TEA_TRAIN_NEIGHBOR_IDX_MAP_PATH = DATA_BASE_PATH / "tea_neighbor_idx_train.pkl"
+TEA_TEST_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "tea_neighbor_matrix_test.npy"
+TEA_TEST_NEIGHBOR_IDX_MAP_PATH = DATA_BASE_PATH / "tea_neighbor_idx_test.pkl"
+
+MATCHA_PATH = DATA_BASE_PATH / "matcha.out"
+
+
+TRAIN_FASTA_PATH_SPLIT = DATA_BASE_PATH / "train_split.fasta"
+VAL_FASTA_PATH_SPLIT = DATA_BASE_PATH / "val_split.fasta"
+
+# Validation-specific neighbor priors (computed using only train proteins as neighbors)
+VAL_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "neighbor_matrix_path_val.npy"
+VAL_NEIGHBOR_MATRIX_IDX_MAP_PATH = (
+    DATA_BASE_PATH / "neighbor_matrix_path_val_idx_map.pkl"
+)
+VAL_TEXT_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "text_neighbor_matrix_val.npy"
+VAL_TEXT_NEIGHBOR_IDX_MAP_PATH = DATA_BASE_PATH / "text_neighbor_matrix_val_idx.pkl"
+VAL_TEA_NEIGHBOR_MATRIX_PATH = DATA_BASE_PATH / "tea_neighbor_matrix_val.npy"
+VAL_TEA_NEIGHBOR_IDX_MAP_PATH = DATA_BASE_PATH / "tea_neighbor_idx_val.pkl"

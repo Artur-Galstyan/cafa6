@@ -3,6 +3,8 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, PRNGKeyArray
 
+from cafa6.config import TrainConfig
+
 
 class AttentionPooling(eqx.Module):
     """
@@ -32,18 +34,15 @@ class TextEmbeddingModel(eqx.Module):
 
     def __init__(
         self,
-        text_embedding_size: int,
-        out_size: int,
-        depth: int,
-        width_size: int,
+        config: TrainConfig,
         *,
         key: PRNGKeyArray,
     ):
         self.mlp = eqx.nn.MLP(
-            in_size=text_embedding_size,
-            out_size=out_size,
-            depth=depth,
-            width_size=width_size,
+            in_size=config.text_embedding_size,
+            out_size=config.n_terms,
+            depth=config.text_embedding_mlp_depth,
+            width_size=config.text_embedding_mlp_width,
             activation=jax.nn.silu,
             key=key,
         )
@@ -107,20 +106,17 @@ class ESMModel(eqx.Module):
 
     def __init__(
         self,
-        in_size: int,
-        out_size: int,
-        depth: int,
-        width_size: int,
+        config: TrainConfig,
         *,
         key: PRNGKeyArray,
     ):
         k1, k2 = jax.random.split(key, 2)
 
         self.mlp = eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            depth=depth,
-            width_size=width_size,
+            in_size=config.esm_embedding_size,
+            out_size=config.n_terms,
+            depth=config.esm_model_depth,
+            width_size=config.esm_model_width_size,
             activation=jax.nn.silu,
             key=k2,
         )
@@ -145,23 +141,23 @@ class DeepGOModel(eqx.Module):
 
     def __init__(
         self,
-        n_terms: int,
-        embedding_size: int,
-        esm_embedding_size: int,
-        esm_proj_width_size: int,
-        esm_proj_depth: int,
+        config: TrainConfig,
         *,
         key: PRNGKeyArray,
     ):
         key, mlp_key, radii_key, fn_key = jax.random.split(key, 4)
-        self.term_centers = eqx.nn.Embedding(n_terms, embedding_size, key=key)
-        self.term_radii = jax.random.normal(key=radii_key, shape=(n_terms, 1))
-        self.has_function = jax.random.normal(key=fn_key, shape=(embedding_size,))
+        self.term_centers = eqx.nn.Embedding(
+            config.n_terms, config.deepgo_se_embedding_size, key=key
+        )
+        self.term_radii = jax.random.normal(key=radii_key, shape=(config.n_terms, 1))
+        self.has_function = jax.random.normal(
+            key=fn_key, shape=(config.deepgo_se_embedding_size,)
+        )
         self.mlp = eqx.nn.MLP(
-            in_size=esm_embedding_size,
-            out_size=embedding_size,
-            width_size=esm_proj_width_size,
-            depth=esm_proj_depth,
+            in_size=config.esm_embedding_size,
+            out_size=config.deepgo_se_embedding_size,
+            width_size=config.esm_proj_width_size,
+            depth=config.esm_proj_depth,
             activation=jax.nn.silu,
             key=mlp_key,
         )
@@ -186,25 +182,31 @@ class PerTermGating(eqx.Module):
 
     n_terms: int
 
-    def __init__(self, n_terms: int, protein_emb_size: int, *, key: PRNGKeyArray):
+    def __init__(self, config: TrainConfig, *, key: PRNGKeyArray):
         self.gate_mlp = eqx.nn.MLP(
-            in_size=protein_emb_size,
-            out_size=n_terms * 4,
-            width_size=512,
-            depth=2,
+            in_size=config.esm_embedding_size,
+            out_size=config.n_terms * 5,
+            width_size=config.gate_mlp_width_size,
+            depth=config.gate_mlp_depth,
             key=key,
         )
-        self.n_terms = n_terms
+        self.n_terms = config.n_terms
 
     def __call__(
-        self, protein_emb, deepgo_logits, esm_logits, taxa_logits, text_logits
+        self,
+        protein_emb,
+        deepgo_logits,
+        esm_logits,
+        taxa_logits,
+        text_logits,
+        tea_logits,
     ):
         stacked = jnp.stack(
-            [deepgo_logits, esm_logits, taxa_logits, text_logits], axis=-1
+            [deepgo_logits, esm_logits, taxa_logits, text_logits, tea_logits], axis=-1
         )  # (n_terms, 3)
 
-        gate_flat = self.gate_mlp(protein_emb)  # (n_terms * 4,)
-        gates = gate_flat.reshape(self.n_terms, 4)
+        gate_flat = self.gate_mlp(protein_emb)
+        gates = gate_flat.reshape(self.n_terms, 5)
         gates = jax.nn.softmax(gates, axis=-1)
 
         return (stacked * gates).sum(axis=-1)
@@ -230,68 +232,56 @@ class Model(eqx.Module):
     inference: bool
 
     text_embedding_model: TextEmbeddingModel
+    tea_mlp: eqx.nn.MLP
 
     def __init__(
         self,
-        n_terms: int,
-        text_embedding_size: int,
-        text_embedding_hidden_size: int,
-        text_embedding_mlp_width: int,
-        text_embedding_mlp_depth: int,
-        embedding_size: int,
-        esm_embedding_size: int,
-        esm_proj_width_size: int,
-        esm_proj_depth: int,
-        taxa_vocab_size: int,
-        taxa_embedding_size: int,
-        taxa_mlp_depth: int,
-        taxa_mlp_width: int,
-        esm_model_width_size: int,
-        esm_model_depth: int,
+        config: TrainConfig,
         *,
         key: PRNGKeyArray,
     ):
-        key, deepgo_key, taxa_key, esm_key, cond_key, attn_key, gate_key, text_key = (
-            jax.random.split(key, 8)
-        )
-        self.gate = PerTermGating(n_terms, esm_embedding_size, key=gate_key)
+        (
+            key,
+            deepgo_key,
+            taxa_key,
+            esm_key,
+            cond_key,
+            attn_key,
+            gate_key,
+            text_key,
+            tea_key,
+        ) = jax.random.split(key, 9)
+        self.gate = PerTermGating(config, key=gate_key)
         self.deepgo = DeepGOModel(
-            n_terms,
-            embedding_size,
-            esm_embedding_size,
-            esm_proj_width_size,
-            esm_proj_depth,
+            config,
             key=deepgo_key,
         )
 
         self.taxa_embeddings = eqx.nn.Embedding(
-            taxa_vocab_size,
-            taxa_embedding_size,
+            config.taxa_vocab_size,
+            config.taxa_embedding_size,
             key=key,
         )
         self.taxa_mlp = eqx.nn.MLP(
-            taxa_embedding_size,
-            n_terms,
-            depth=taxa_mlp_depth,
-            width_size=taxa_mlp_width,
+            config.taxa_embedding_size,
+            config.n_terms,
+            depth=config.taxa_mlp_depth,
+            width_size=config.taxa_mlp_width,
             activation=jax.nn.silu,
             key=taxa_key,
         )
 
-        self.taxa_norm = eqx.nn.LayerNorm(shape=(taxa_embedding_size))
+        self.taxa_norm = eqx.nn.LayerNorm(shape=(config.taxa_embedding_size))
 
-        self.esm_norm = eqx.nn.LayerNorm(esm_embedding_size)
+        self.esm_norm = eqx.nn.LayerNorm(config.esm_embedding_size)
         self.esm_model = ESMModel(
-            esm_embedding_size,
-            n_terms,
-            esm_model_width_size,
-            esm_model_depth,
+            config,
             key=esm_key,
         )
 
         self.condition_mlp = eqx.nn.MLP(
             in_size=1,
-            out_size=esm_embedding_size,
+            out_size=config.esm_embedding_size,
             width_size=64,
             depth=2,
             activation=jax.nn.silu,
@@ -312,11 +302,16 @@ class Model(eqx.Module):
         #     key=text_key,
         # )
         self.text_embedding_model = TextEmbeddingModel(
-            text_embedding_size,
-            n_terms,
-            text_embedding_mlp_depth,
-            text_embedding_mlp_width,
+            config,
             key=text_key,
+        )
+
+        self.tea_mlp = eqx.nn.MLP(
+            in_size=config.n_terms,
+            out_size=config.n_terms,
+            width_size=config.tea_mlp_width_size,
+            depth=config.tea_mlp_depth,
+            key=tea_key,
         )
 
     def __call__(
@@ -324,6 +319,7 @@ class Model(eqx.Module):
         esm_emb: Array,
         neighbor_prior: Float[Array, "n_terms"],
         text_neighbor_prior: Float[Array, "text_embedding_size"],
+        tea_neighbor_prior: Float[Array, "n_terms"],
         taxa: Int[Array, ""],
         mask: Float[Array, "max_seq_len"],
         condition: Float[Array, "1"],
@@ -331,21 +327,25 @@ class Model(eqx.Module):
     ):
         orig_esm_emb = esm_emb
         esm_emb = self.dropout(esm_emb, key=key)
-        # esm_emb = self.attn_pool(esm_emb, mask)
         cond_emb = self.condition_mlp(condition)
         esm_emb += cond_emb
         taxa_embeddings = self.taxa_embeddings(taxa)
         taxa_embeddings = self.taxa_norm(taxa_embeddings)
         taxa_logits = self.taxa_mlp(taxa_embeddings)
 
-        deepgo_logits = self.deepgo(esm_emb)
+        deepgo_logits = self.deepgo(orig_esm_emb)
 
         esm_emb = self.esm_norm(esm_emb)
         esm_logits = self.esm_model(esm_emb, neighbor_prior)
 
         # text_logits = self.text_embedding_model(orig_esm_emb, text_neighbor_prior)
         text_logits = self.text_embedding_model(text_neighbor_prior)
-
+        tea_logits = self.tea_mlp(tea_neighbor_prior)
         return self.gate(
-            orig_esm_emb, deepgo_logits, esm_logits, taxa_logits, text_logits
+            orig_esm_emb,
+            deepgo_logits,
+            esm_logits,
+            taxa_logits,
+            text_logits,
+            tea_logits,
         )

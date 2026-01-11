@@ -12,3 +12,4 @@ wheels/
 data/
 weights/
 *submission.tsv
+tmp

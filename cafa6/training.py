@@ -1,6 +1,7 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
 import json
 
 import coolname
@@ -11,62 +12,25 @@ import mlflow
 import numpy as np
 import optax
 import polars as pl
-from beartype.typing import Literal
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
-from pydantic import BaseModel
 from tqdm import tqdm
 
+from cafa6.config import TrainConfig
 from cafa6.constants import (
-    ESM_MODEL,
     IA_PATH,
-    MODEL_TO_DIMS,
-    TERM_TO_IDX_LOOKUP_PATH,
     WEIGHTS_BASE_PATH,
 )
 from cafa6.data import (
     create_train_loader,
     create_val_loader,
     get_datasources,
+    get_split_datasources,
     get_transformations,
+    get_val_transformations,
 )
 from cafa6.eval import evaluate
 from cafa6.model import Model
 from cafa6.utils import get_graph_edges
-
-
-class TrainConfig(BaseModel):
-    batch_size: int = 512
-    learning_rate: float = 0.0007
-    num_epochs: int = 20
-    worker_count: int = 16
-    patience: int = 10
-
-    knn: int = 6
-    max_protein_seq: int = 1024
-
-    esm_model: str = "esmc_600m"
-    esm_strategy: Literal["raw", "mean"] = "mean"
-
-    deepgo_se_embedding_size: int = 2048
-
-    esm_proj_width_size: int = 2048
-    esm_proj_depth: int = 3
-
-    taxa_embedding_size: int = 1024
-    taxa_vocab_size: int = 8500
-    taxa_mlp_depth: int = 3
-    taxa_mlp_width: int = 1024
-
-    esm_model_width_size: int = 2048
-    esm_model_depth: int = 3
-
-    warmup_steps: int = 400
-    ratio: float = 0.2
-
-    text_embedding_size: int = 1024  # voyage embs, don't change!
-    text_embedding_hidden_size: int = 512
-    text_embedding_mlp_width: int = 1024
-    text_embedding_mlp_depth: int = 2
 
 
 def _setup_mlflow():
@@ -183,7 +147,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     assert model_name is not None
     print("Training model with name:")
     print(model_name)
-    n_terms = len(pl.read_csv(TERM_TO_IDX_LOOKUP_PATH))
+
     terms_to_idx_weight: dict[str, tuple[int, float]] = {}
     idx_to_terms_weight: dict[int, tuple[str, float]] = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
@@ -196,42 +160,29 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     go_term_weights = np.array(
         [w for _, (_, w) in sorted(terms_to_idx_weight.items(), key=lambda x: x[1][0])]
     )
-    model_config = {
-        "n_terms": n_terms,
-        "embedding_size": train_config.deepgo_se_embedding_size,
-        "esm_embedding_size": MODEL_TO_DIMS[ESM_MODEL],
-        "esm_proj_width_size": train_config.esm_proj_width_size,
-        "esm_proj_depth": train_config.esm_proj_depth,
-        "taxa_embedding_size": train_config.taxa_embedding_size,
-        "taxa_vocab_size": train_config.taxa_vocab_size,
-        "taxa_mlp_depth": train_config.taxa_mlp_depth,
-        "taxa_mlp_width": train_config.taxa_mlp_width,
-        "esm_model_width_size": train_config.esm_model_width_size,
-        "esm_model_depth": train_config.esm_model_depth,
-        "text_embedding_size": train_config.text_embedding_size,
-        "text_embedding_hidden_size": train_config.text_embedding_hidden_size,
-        "text_embedding_mlp_width": train_config.text_embedding_mlp_width,
-        "text_embedding_mlp_depth": train_config.text_embedding_mlp_depth,
-    }
+
     model = Model(
-        **model_config,
+        train_config,
         key=jax.random.key(0),
     )
 
-    transformations = get_transformations(train_config.batch_size)
-    train_data_source, val_data_source, n_total = get_datasources()
+    train_ds, val_ds, n_train = get_split_datasources()
+    train_transforms = get_transformations(batch_size=train_config.batch_size)
+    val_transforms = get_val_transformations(batch_size=train_config.batch_size)
+
     train_data_loader = create_train_loader(
-        train_data_source,
-        transformations,
+        train_ds,
+        train_transforms,
         train_config.batch_size,
         train_config.num_epochs,
         train_config.worker_count,
     )
+
     best_model = model
     children, parents = get_graph_edges(terms_to_idx)
     ontology_graph = jnp.vstack((children, parents)).T
 
-    total_steps = (n_total // train_config.batch_size) * train_config.num_epochs
+    total_steps = (n_train // train_config.batch_size) * train_config.num_epochs
 
     scheduler = optax.warmup_cosine_decay_schedule(
         init_value=1e-5,
@@ -258,19 +209,37 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
         epoch = 0
         epoch_loss = 0.0
 
-        steps_per_epoch = n_total // train_config.batch_size
+        steps_per_epoch = n_train // train_config.batch_size
         total_steps = steps_per_epoch * train_config.num_epochs
 
         for step, batch in tqdm(
             enumerate(train_data_loader),
-            total=(n_total // train_config.batch_size),
+            total=(n_train // train_config.batch_size),
         ):
             key, subkey = jax.random.split(key)
-            idx, esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = batch
-            esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask, y = (
+            (
+                idx,
+                esm_emb,
+                neighbor_prior,
+                text_neighbor_priors,
+                tea_neighbor_priors,
+                taxon,
+                mask,
+                y,
+            ) = batch
+            (
+                esm_emb,
+                neighbor_prior,
+                text_neighbor_priors,
+                tea_neighbor_priors,
+                taxon,
+                mask,
+                y,
+            ) = (
                 jnp.array(esm_emb),
                 jnp.array(neighbor_prior),
                 jnp.array(text_neighbor_priors),
+                jnp.array(tea_neighbor_priors),
                 jnp.array(taxon),
                 jnp.array(mask),
                 jnp.array(y),
@@ -278,7 +247,14 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
 
             model, opt_state, loss = step_fn(
                 model,
-                (esm_emb, neighbor_prior, text_neighbor_priors, taxon, mask),
+                (
+                    esm_emb,
+                    neighbor_prior,
+                    text_neighbor_priors,
+                    tea_neighbor_priors,
+                    taxon,
+                    mask,
+                ),
                 y,
                 optimizer,
                 opt_state,
@@ -295,7 +271,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
                 avg_loss = epoch_loss / steps_per_epoch
                 epoch_loss = 0.0
 
-                val_loader = create_val_loader(val_data_source, transformations)
+                val_loader = create_val_loader(val_ds, val_transforms)
                 val_iterator = iter(val_loader)
                 score = evaluate(model, val_iterator)
 
@@ -319,10 +295,10 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     eqx.tree_serialise_leaves(WEIGHTS_BASE_PATH / f"{model_name}.eqx", best_model)
 
     with open(WEIGHTS_BASE_PATH / f"{model_name}-config.json", "w") as f:
-        json.dump(model_config, f)
+        json.dump(train_config.model_dump(), f)
 
     return model
 
 
-if __name__ == "__main__":
+def main():
     train()

@@ -26,3 +26,8 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["cafa6"]
+
+
+[project.scripts]
+train = "cafa6.training:main"
+create_submission = "cafa6.scripts.create_submission:main"
