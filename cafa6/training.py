@@ -9,7 +9,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import mlflow
-import numpy as np
 import optax
 import polars as pl
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
@@ -17,16 +16,16 @@ from tqdm import tqdm
 
 from cafa6.config import TrainConfig
 from cafa6.constants import (
+    DATA_BASE_PATH,
     IA_PATH,
     WEIGHTS_BASE_PATH,
 )
 from cafa6.data import (
     create_train_loader,
     create_val_loader,
-    get_datasources,
-    get_split_datasources,
-    get_transformations,
-    get_val_transformations,
+    get_train_transforms,
+    get_train_val_datasources,
+    get_val_transforms,
 )
 from cafa6.eval import evaluate
 from cafa6.model import Model
@@ -61,13 +60,6 @@ def axiom_loss(
     return jnp.mean(jax.nn.relu(axiom_loss))
 
 
-def focal_weight(probs, labels, gamma=2.0):
-    p_t = labels * probs + (1 - labels) * (1 - probs)
-    focal_weight = (1 - p_t) ** gamma
-
-    return focal_weight
-
-
 def hierarchy_consistency_loss(probs, ontology_graph):
     child_idx = ontology_graph[:, 0]
     parent_idx = ontology_graph[:, 1]
@@ -75,7 +67,6 @@ def hierarchy_consistency_loss(probs, ontology_graph):
     child_probs = probs[:, child_idx]
     parent_probs = probs[:, parent_idx]
 
-    # Child should never be > parent
     violation = jax.nn.relu(child_probs - parent_probs)
     return violation.mean()
 
@@ -110,7 +101,7 @@ def loss_fn(
 
     hierarchy_loss_value = hierarchy_consistency_loss(probs, ontology_graph)
 
-    return base_loss + axiom_loss_value + 0.3 * hierarchy_loss_value
+    return base_loss + axiom_loss_value + 2 * hierarchy_loss_value
 
 
 @eqx.filter_jit
@@ -148,27 +139,25 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     print("Training model with name:")
     print(model_name)
 
-    terms_to_idx_weight: dict[str, tuple[int, float]] = {}
-    idx_to_terms_weight: dict[int, tuple[str, float]] = {}
+    terms_to_idx: dict[str, int] = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
     for i, row in enumerate(ia_df.iter_rows(named=True)):
-        terms_to_idx_weight[row["term"]] = (i, row["weight"])
-        idx_to_terms_weight[i] = (row["term"], row["weight"])
+        terms_to_idx[row["term"]] = i
 
-    terms_to_idx = {t: idx for t, (idx, _) in terms_to_idx_weight.items()}
-
-    go_term_weights = np.array(
-        [w for _, (_, w) in sorted(terms_to_idx_weight.items(), key=lambda x: x[1][0])]
-    )
+    go_term_weights = ia_df["weight"].to_numpy()
 
     model = Model(
         train_config,
         key=jax.random.key(0),
     )
 
-    train_ds, val_ds, n_train = get_split_datasources()
-    train_transforms = get_transformations(batch_size=train_config.batch_size)
-    val_transforms = get_val_transformations(batch_size=train_config.batch_size)
+    labels_path = DATA_BASE_PATH / f"{train_config.training_set}.tsv"
+    train_ds, val_ds, n_train = get_train_val_datasources(
+        labels_path=labels_path,
+        ratio=train_config.ratio,
+    )
+    train_transforms = get_train_transforms(batch_size=train_config.batch_size)
+    val_transforms = get_val_transforms(batch_size=train_config.batch_size)
 
     train_data_loader = create_train_loader(
         train_ds,
@@ -197,7 +186,6 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
         optax.adamw(learning_rate=scheduler),
     )
 
-    # optimizer = optax.MultiSteps(optimizer, every_k_schedule=16)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     key = jax.random.key(1)
 
@@ -210,51 +198,18 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
         epoch_loss = 0.0
 
         steps_per_epoch = n_train // train_config.batch_size
-        total_steps = steps_per_epoch * train_config.num_epochs
 
         for step, batch in tqdm(
             enumerate(train_data_loader),
-            total=(n_train // train_config.batch_size),
+            total=total_steps,
         ):
             key, subkey = jax.random.split(key)
-            (
-                idx,
-                esm_emb,
-                neighbor_prior,
-                text_neighbor_priors,
-                tea_neighbor_priors,
-                taxon,
-                mask,
-                y,
-            ) = batch
-            (
-                esm_emb,
-                neighbor_prior,
-                text_neighbor_priors,
-                tea_neighbor_priors,
-                taxon,
-                mask,
-                y,
-            ) = (
-                jnp.array(esm_emb),
-                jnp.array(neighbor_prior),
-                jnp.array(text_neighbor_priors),
-                jnp.array(tea_neighbor_priors),
-                jnp.array(taxon),
-                jnp.array(mask),
-                jnp.array(y),
-            )
+            idx, esm_emb, y = batch
+            esm_emb, y = jnp.array(esm_emb), jnp.array(y)
 
             model, opt_state, loss = step_fn(
                 model,
-                (
-                    esm_emb,
-                    neighbor_prior,
-                    text_neighbor_priors,
-                    tea_neighbor_priors,
-                    taxon,
-                    mask,
-                ),
+                (esm_emb,),
                 y,
                 optimizer,
                 opt_state,
@@ -272,8 +227,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
                 epoch_loss = 0.0
 
                 val_loader = create_val_loader(val_ds, val_transforms)
-                val_iterator = iter(val_loader)
-                score = evaluate(model, val_iterator)
+                score = evaluate(model, val_loader)
 
                 mlflow.log_metric("validation_score", score, step=step)
                 mlflow.log_metric("epoch_avg_loss", avg_loss, step=step)

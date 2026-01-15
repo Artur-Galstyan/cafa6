@@ -13,8 +13,8 @@ from tqdm import tqdm
 
 from cafa6.config import TrainConfig
 from cafa6.constants import (
+    IA_PATH,
     PARTIAL_SUBMISSION_FULL_PATH,
-    TERM_TO_IDX_LOOKUP_PATH,
     WEIGHTS_BASE_PATH,
 )
 from cafa6.data import get_test_loader
@@ -22,23 +22,9 @@ from cafa6.model import Model
 
 
 @eqx.filter_jit
-def _get_preds(
-    model,
-    esm_emb,
-    neighbor_priors,
-    text_neighbor_priors,
-    tea_neighbor_priors,
-    taxons,
-    masks,
-    condition,
-):
-    preds = eqx.filter_vmap(model, in_axes=(0, 0, 0, 0, 0, 0, None, None))(
+def _get_preds(model, esm_emb, condition):
+    preds = eqx.filter_vmap(model, in_axes=(0, None, None))(
         esm_emb,
-        neighbor_priors,
-        text_neighbor_priors,
-        tea_neighbor_priors,
-        taxons,
-        masks,
         condition,
         None,
     )
@@ -56,6 +42,7 @@ def create_submission(
     tta_conditions: list[float] | None = None,
     save: bool = False,
     include_partial: bool = True,
+    is_val: bool = False,
 ) -> pl.DataFrame:
     if tta_conditions is None:
         tta_conditions = [15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
@@ -81,7 +68,8 @@ def create_submission(
 
     model = eqx.nn.inference_mode(model)
 
-    terms_to_idx_df = pl.read_csv(TERM_TO_IDX_LOOKUP_PATH)
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    idx_to_term = {i: row["term"] for i, row in enumerate(ia_df.iter_rows(named=True))}
 
     if not data_loader:
         data_loader = get_test_loader(batch_size, worker_count)
@@ -91,47 +79,16 @@ def create_submission(
     buffer_values = []
 
     for batch in tqdm(data_loader, desc="Inference"):
-        (
-            idx,
-            esm_emb,
-            neighbor_prior,
-            text_neighbor_priors,
-            tea_neighbor_priors,
-            taxon,
-            mask,
-            y,
-        ) = batch
-        (
-            esm_emb,
-            neighbor_prior,
-            text_neighbor_priors,
-            tea_neighbor_priors,
-            taxon,
-            mask,
-            y,
-        ) = (
-            jnp.array(esm_emb),
-            jnp.array(neighbor_prior),
-            jnp.array(text_neighbor_priors),
-            jnp.array(tea_neighbor_priors),
-            jnp.array(taxon),
-            jnp.array(mask),
-            jnp.array(y),
-        )
+        if is_val:
+            idx, esm_emb, _ = batch
+        else:
+            idx, esm_emb, taxon = batch
+        esm_emb = jnp.array(esm_emb)
 
         all_preds = []
         for cond_val in tta_conditions:
             condition = jnp.array([cond_val])
-            preds = _get_preds(
-                model,
-                esm_emb,
-                neighbor_prior,
-                text_neighbor_priors,
-                tea_neighbor_priors,
-                taxon,
-                mask,
-                condition,
-            )
+            preds = _get_preds(model, esm_emb, condition)
             all_preds.append(preds)
 
         avg_preds = jnp.stack(all_preds).mean(axis=0)
@@ -150,8 +107,9 @@ def create_submission(
         {"EntryID": buffer_ids, "index": buffer_indices, "value": buffer_values}
     )
 
-    current_preds = raw_submission.join(terms_to_idx_df, on="index", how="left")
-    current_preds = current_preds.select(["EntryID", "term", "value"])
+    current_preds = raw_submission.with_columns(
+        pl.col("index").replace_strict(idx_to_term).alias("term")
+    ).select(["EntryID", "term", "value"])
 
     if include_partial:
         partial_submission = pl.read_csv(PARTIAL_SUBMISSION_FULL_PATH)
@@ -172,7 +130,6 @@ def create_submission(
     )
     if save:
         final_submission.write_csv(output_path, include_header=False, separator="\t")
-        # Dump the model.py file as a txt file
         model_py_path = Path(__file__).parent.parent / "model.py"
         architecture_output_path = WEIGHTS_BASE_PATH / f"{model_name}-architecture.txt"
         with open(model_py_path, "r") as f:
@@ -187,3 +144,7 @@ def create_submission(
 
 def main():
     Fire(create_submission)
+
+
+if __name__ == "__main__":
+    main()
