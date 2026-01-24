@@ -1,31 +1,10 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jaxonlayers.layers import TransformerEncoderLayer
 from jaxtyping import Array, Float, PRNGKeyArray
 
 from cafa6.config import TrainConfig
-
-
-class ESMModel(eqx.Module):
-    mlp: eqx.nn.MLP
-
-    def __init__(
-        self,
-        config: TrainConfig,
-        *,
-        key: PRNGKeyArray,
-    ):
-        self.mlp = eqx.nn.MLP(
-            in_size=config.esm_embedding_size,
-            out_size=config.n_terms,
-            depth=config.esm_model_depth,
-            width_size=config.esm_model_width_size,
-            activation=jax.nn.silu,
-            key=key,
-        )
-
-    def __call__(self, esm_emb: Array):
-        return self.mlp(esm_emb)
 
 
 class DeepGOModel(eqx.Module):
@@ -49,6 +28,7 @@ class DeepGOModel(eqx.Module):
         self.has_function = jax.random.normal(
             key=fn_key, shape=(config.deepgo_se_embedding_size,)
         )
+
         self.mlp = eqx.nn.MLP(
             in_size=config.esm_embedding_size,
             out_size=config.deepgo_se_embedding_size,
@@ -71,42 +51,11 @@ class DeepGOModel(eqx.Module):
         return (similarity_vector + self.term_radii.T).squeeze()
 
 
-class PerTermGating(eqx.Module):
-    gate_mlp: eqx.nn.MLP
-
-    n_terms: int
-
-    def __init__(self, config: TrainConfig, *, key: PRNGKeyArray):
-        self.gate_mlp = eqx.nn.MLP(
-            in_size=config.esm_embedding_size,
-            out_size=config.n_terms * 2,
-            width_size=config.gate_mlp_width_size,
-            depth=config.gate_mlp_depth,
-            key=key,
-        )
-        self.n_terms = config.n_terms
-
-    def __call__(
-        self,
-        protein_emb,
-        deepgo_logits,
-        esm_logits,
-    ):
-        stacked = jnp.stack([deepgo_logits, esm_logits], axis=-1)
-
-        gate_flat = self.gate_mlp(protein_emb)
-        gates = gate_flat.reshape(self.n_terms, 2)
-        gates = jax.nn.softmax(gates, axis=-1)
-
-        return (stacked * gates).sum(axis=-1)
-
-
 class Model(eqx.Module):
-    gate: PerTermGating
     deepgo: DeepGOModel
 
-    esm_model: ESMModel
-    esm_norm: eqx.nn.LayerNorm
+    taxon_embeddings: eqx.nn.Embedding
+    taxon_linear: eqx.nn.Linear
 
     condition_mlp: eqx.nn.MLP
 
@@ -119,13 +68,18 @@ class Model(eqx.Module):
         *,
         key: PRNGKeyArray,
     ):
-        key, deepgo_key, esm_key, cond_key, gate_key = jax.random.split(key, 5)
+        key, deepgo_key, taxon_key, taxon_lin_key, cond_key = jax.random.split(key, 5)
 
-        self.gate = PerTermGating(config, key=gate_key)
         self.deepgo = DeepGOModel(config, key=deepgo_key)
 
-        self.esm_norm = eqx.nn.LayerNorm(config.esm_embedding_size)
-        self.esm_model = ESMModel(config, key=esm_key)
+        self.taxon_embeddings = eqx.nn.Embedding(
+            config.n_taxons, config.taxon_embedding_size, key=taxon_key
+        )
+        self.taxon_linear = eqx.nn.Linear(
+            in_features=config.taxon_embedding_size,
+            out_features=config.n_terms,
+            key=taxon_lin_key,
+        )
 
         self.condition_mlp = eqx.nn.MLP(
             in_size=1,
@@ -142,17 +96,13 @@ class Model(eqx.Module):
     def __call__(
         self,
         esm_emb: Array,
+        taxon: Array,
         condition: Float[Array, "1"],
         key: PRNGKeyArray | None = None,
     ):
-        orig_esm_emb = esm_emb
         esm_emb = self.dropout(esm_emb, key=key)
-        cond_emb = self.condition_mlp(condition)
-        esm_emb = esm_emb + cond_emb
+        esm_emb += self.condition_mlp(condition)
+        deepgo_logits = self.deepgo(esm_emb)
+        taxon_logits = self.taxon_linear(self.taxon_embeddings(taxon))
 
-        deepgo_logits = self.deepgo(orig_esm_emb)
-
-        esm_emb = self.esm_norm(esm_emb)
-        esm_logits = self.esm_model(esm_emb)
-
-        return self.gate(orig_esm_emb, deepgo_logits, esm_logits)
+        return deepgo_logits + taxon_logits

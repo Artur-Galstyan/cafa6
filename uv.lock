@@ -297,6 +297,7 @@ dependencies = [
     { name = "optax" },
     { name = "polars" },
     { name = "pydantic" },
+    { name = "python-dotenv" },
     { name = "tqdm" },
     { name = "voyageai" },
 ]
@@ -318,6 +319,7 @@ requires-dist = [
     { name = "optax", specifier = ">=0.2.6" },
     { name = "polars", specifier = ">=1.36.1" },
     { name = "pydantic", specifier = ">=2.12.5" },
+    { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "voyageai", specifier = ">=0.3.7" },
 ]

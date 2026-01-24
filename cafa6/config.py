@@ -12,24 +12,29 @@ class TrainingSets:
 
 class TrainConfig(BaseModel):
     n_terms: int = 40_122
-    batch_size: int = 1024
-    learning_rate: float = 0.0008
-    num_epochs: int = 50
-    worker_count: int = 16
-    patience: int = 10
+    n_deepgo_models: int = 1
+    n_taxons: int = 8453
+    batch_size: int = 4096
+    accumulation_steps: int = 4
+    # batch_size: int = 16384 * 2
+    taxon_embedding_size: int = 1024
+    learning_rate: float = 0.0009
+    num_epochs: int = 80
+    worker_count: int = 2
+    patience: int = 15
 
-    ratio: float = 0.2
+    ratio: float = 0.15
     training_set: str = TrainingSets.SET_6_MAX_SCALE_GOOD
 
     esm_model: str = "esmc_600m"
 
-    deepgo_se_embedding_size: int = 2048
+    deepgo_se_embedding_size: int = 1024
 
     esm_proj_width_size: int = 1024
-    esm_proj_depth: int = 2
+    esm_proj_depth: int = 3
 
     esm_model_width_size: int = 1024
-    esm_model_depth: int = 2
+    esm_model_depth: int = 3
 
     warmup_steps: int = 500
 

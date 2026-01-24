@@ -1,5 +1,7 @@
 import os
 
+from beartype.typing import Literal
+
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import json
@@ -71,6 +73,19 @@ def hierarchy_consistency_loss(probs, ontology_graph):
     return violation.mean()
 
 
+def focal_loss(
+    logits: Float[Array, "batch n_terms"],
+    labels: Float[Array, "batch n_terms"],
+    gamma: float = 2.0,
+):
+    probs = jax.nn.sigmoid(logits)
+    probs = jnp.clip(probs, 1e-6, 1 - 1e-6)
+    p_t = labels * probs + (1 - labels) * (1 - probs)
+    focal_weight = (1 - p_t) ** gamma
+    bce = optax.sigmoid_binary_cross_entropy(logits, labels)
+    return focal_weight * bce
+
+
 def loss_fn(
     model: PyTree,
     X: tuple[Array, ...],
@@ -86,7 +101,8 @@ def loss_fn(
 
     smoothing = 0.05
     soft_labels = labels * (1.0 - smoothing) + 0.5 * smoothing
-    per_term_loss = optax.sigmoid_binary_cross_entropy(logits, soft_labels)
+
+    per_term_loss = focal_loss(logits, soft_labels, gamma=2.0)
 
     weight_multiplier = 1.0 + (labels * (sampled_weight - 1.0))
     weighted_loss = per_term_loss * weight_multiplier * go_term_weight
@@ -101,7 +117,7 @@ def loss_fn(
 
     hierarchy_loss_value = hierarchy_consistency_loss(probs, ontology_graph)
 
-    return base_loss + axiom_loss_value + 2 * hierarchy_loss_value
+    return base_loss + axiom_loss_value + 0.3 * hierarchy_loss_value
 
 
 @eqx.filter_jit
@@ -187,9 +203,10 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     )
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    # model, opt_state = eqx.filter_shard((model, opt_state), model_sharding)
     key = jax.random.key(1)
 
-    with mlflow.start_run(description=model_name):
+    with mlflow.start_run(description=model_name, run_name=model_name):
         mlflow.log_params(train_config.model_dump())
 
         best_score = 0.0
@@ -204,12 +221,13 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
             total=total_steps,
         ):
             key, subkey = jax.random.split(key)
-            idx, esm_emb, y = batch
-            esm_emb, y = jnp.array(esm_emb), jnp.array(y)
+            idx, *model_inputs, y = batch
+            model_inputs = tuple(jnp.array(m) for m in model_inputs)
+            y = jnp.array(y)
 
             model, opt_state, loss = step_fn(
                 model,
-                (esm_emb,),
+                model_inputs,
                 y,
                 optimizer,
                 opt_state,
@@ -221,7 +239,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
             mlflow.log_metric("train_loss", curr_loss, step=step)
             epoch_loss += curr_loss
 
-            if (step + 1) % steps_per_epoch == 0:
+            if (step + 1) % (steps_per_epoch * 5) == 0:
                 epoch += 1
                 avg_loss = epoch_loss / steps_per_epoch
                 epoch_loss = 0.0
@@ -254,5 +272,6 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     return model
 
 
-def main():
+def main(gpu: Literal[0, 1] = 0):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     train()

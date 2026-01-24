@@ -22,10 +22,9 @@ from cafa6.model import Model
 
 
 @eqx.filter_jit
-def _get_preds(model, esm_emb, condition):
-    preds = eqx.filter_vmap(model, in_axes=(0, None, None))(
-        esm_emb,
-        condition,
+def _get_preds(model, data_input: tuple):
+    preds = eqx.filter_vmap(model, in_axes=(0, 0, None, None))(
+        *data_input,
         None,
     )
     preds = jax.nn.sigmoid(preds)
@@ -43,6 +42,7 @@ def create_submission(
     save: bool = False,
     include_partial: bool = True,
     is_val: bool = False,
+    threshold: float = 0.4,
 ) -> pl.DataFrame:
     if tta_conditions is None:
         tta_conditions = [15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
@@ -77,32 +77,49 @@ def create_submission(
     buffer_ids = []
     buffer_indices = []
     buffer_values = []
+    predicted_ics = []
+    ia_df = pl.read_csv(IA_PATH, separator="\t")
+    ic_values_np = ia_df["weight"].to_numpy()
+    ic_values_jax = jnp.array(ic_values_np)
+    ic_values_jax = ic_values_jax if not is_val else 1
 
     for batch in tqdm(data_loader, desc="Inference"):
         if is_val:
-            idx, esm_emb, _ = batch
+            idx, *model_inputs, _ = batch
         else:
-            idx, esm_emb, taxon = batch
-        esm_emb = jnp.array(esm_emb)
+            idx, *model_inputs = batch
+        model_inputs = tuple(jnp.array(m) for m in model_inputs)
 
         all_preds = []
         for cond_val in tta_conditions:
             condition = jnp.array([cond_val])
-            preds = _get_preds(model, esm_emb, condition)
+            preds = _get_preds(model, model_inputs + (condition,))
             all_preds.append(preds)
 
         avg_preds = jnp.stack(all_preds).mean(axis=0)
 
-        top_values, top_indices = jax.lax.top_k(avg_preds, preds_per_term)
+        ic_weighted_preds = avg_preds * ic_values_jax
+        _, top_indices = jax.lax.top_k(ic_weighted_preds, preds_per_term)
+        top_values = jnp.take_along_axis(avg_preds, top_indices, axis=-1)
 
-        top_indices = np.array(top_indices).flatten()
-        top_values = np.array(top_values).flatten()
+        top_indices_np = np.asarray(top_indices).flatten()
+        top_values_np = np.asarray(top_values).flatten()
+
+        predicted_ic = ic_values_np[top_indices_np]
+        predicted_ics.extend(predicted_ic.flatten().tolist())
+
         protein_ids_repeated = np.repeat(idx, preds_per_term)
 
-        buffer_ids.extend(protein_ids_repeated)
-        buffer_indices.extend(top_indices)
-        buffer_values.extend(top_values)
+        buffer_ids.extend(protein_ids_repeated.tolist())
+        buffer_indices.extend(top_indices_np.tolist())
+        buffer_values.extend(top_values_np.tolist())
 
+    if not is_val:
+        predicted_ic = np.array(predicted_ics)
+        print(f"Mean IC of top 50 predictions: {predicted_ic.mean():.3f}")
+        print(
+            f"IC distribution: min={predicted_ic.min():.3f}, max={predicted_ic.max():.3f}"
+        )
     raw_submission = pl.DataFrame(
         {"EntryID": buffer_ids, "index": buffer_indices, "value": buffer_values}
     )
@@ -121,7 +138,10 @@ def create_submission(
         final_submission = new_preds.vstack(partial_submission)
     else:
         final_submission = current_preds
+    final_submission = final_submission.unique(subset=["EntryID", "term"])
     final_submission = cast(pl.DataFrame, final_submission)
+    if not is_val:
+        final_submission = final_submission.filter(pl.col("value") > threshold)
 
     output_path = f"{model_name}-submission.tsv"
 

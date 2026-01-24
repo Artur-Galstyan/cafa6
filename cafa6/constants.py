@@ -25,6 +25,7 @@ UNIPROT_SPROT_FASTA_PATH = DATA_BASE_PATH / "uniprot_sprot.fasta"
 
 MASTER_EMBEDDINGS_PATH = DATA_BASE_PATH / "master_esm_c_600m_embeddings.dat"
 MASTER_INDEX_PATH = DATA_BASE_PATH / "master_esm_c_600m_index.json"
+MASTER_TAXON_INDEX_PATH = DATA_BASE_PATH / "master_taxon_index.json"
 
 SET1_TRAIN_TEST_GOOD_PATH = DATA_BASE_PATH / "set1_train_test_good.tsv"
 SET2_TRAIN_ALL_PATH = DATA_BASE_PATH / "set2_train_all.tsv"

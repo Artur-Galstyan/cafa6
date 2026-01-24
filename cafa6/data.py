@@ -16,6 +16,7 @@ from cafa6.constants import (
     IA_PATH,
     MASTER_EMBEDDINGS_PATH,
     MASTER_INDEX_PATH,
+    MASTER_TAXON_INDEX_PATH,
     SET6_MAX_SCALE_GOOD_PATH,
     TEST_FASTA_PATH,
 )
@@ -46,19 +47,22 @@ class TrainDataSource(RandomAccessDataSource):
         protein_ids: list[str],
         terms: list[list[str]],
         emb_indices: list[int],
+        taxons: list[int],
     ):
         self.protein_ids = protein_ids
         self.terms = terms
         self.emb_indices = emb_indices
+        self.taxons = taxons
 
     def __len__(self) -> int:
         return len(self.protein_ids)
 
-    def __getitem__(self, record_key: SupportsIndex) -> tuple[str, list[str], int]:
+    def __getitem__(self, record_key: SupportsIndex) -> tuple[str, list[str], int, int]:
         return (
             self.protein_ids[record_key],
             self.terms[record_key],
             self.emb_indices[record_key],
+            self.taxons[record_key],
         )
 
 
@@ -67,22 +71,25 @@ class TestDataSource(RandomAccessDataSource):
         self,
         test_fasta_path: str | Path = TEST_FASTA_PATH,
         master_index_path: str | Path = MASTER_INDEX_PATH,
+        master_taxon_path: str | Path = MASTER_TAXON_INDEX_PATH,
     ):
         with open(master_index_path, "r") as f:
             master_index = json.load(f)
 
+        with open(master_taxon_path, "r") as f:
+            master_taxon_index = json.load(f)
+
         self.protein_ids = []
-        self.taxa = []
         self.emb_indices = []
+        self.taxons = []
 
         for record in SeqIO.parse(test_fasta_path, "fasta"):
             protein_id = record.id.split(" ")[0]
-            taxon = int(record.description.split(" ")[1])
 
             if protein_id in master_index:
                 self.protein_ids.append(protein_id)
-                self.taxa.append(taxon)
                 self.emb_indices.append(master_index[protein_id])
+                self.taxons.append(master_taxon_index[protein_id])
 
     def __len__(self) -> int:
         return len(self.protein_ids)
@@ -90,8 +97,8 @@ class TestDataSource(RandomAccessDataSource):
     def __getitem__(self, record_key: SupportsIndex) -> tuple[str, int, int]:
         return (
             self.protein_ids[record_key],
-            self.taxa[record_key],
             self.emb_indices[record_key],
+            self.taxons[record_key],
         )
 
 
@@ -100,10 +107,10 @@ class TrainMapTransform(Map):
         self.terms_to_idx = terms_to_idx
         self.n_terms = len(terms_to_idx)
 
-    def map(self, element: tuple[str, list[str], int]):
+    def map(self, element: tuple[str, list[str], int, int]):
         embeddings, _ = _load_master_embeddings()
 
-        protein_id, terms, emb_idx = element
+        protein_id, terms, emb_idx, taxon = element
 
         esm_embedding = embeddings[emb_idx]
 
@@ -112,41 +119,42 @@ class TrainMapTransform(Map):
         if indices:
             labels[indices] = 1.0
 
-        return (
-            protein_id,
-            esm_embedding,
-            labels,
-        )
+        return (protein_id, esm_embedding, int(taxon), labels)
 
 
 class TestMapTransform(Map):
     def map(self, element: tuple[str, int, int]):
         embeddings, _ = _load_master_embeddings()
 
-        protein_id, taxon, emb_idx = element
+        protein_id, emb_idx, taxon = element
 
         esm_embedding = embeddings[emb_idx]
 
         return (
             protein_id,
             esm_embedding,
-            taxon,
+            int(taxon),
         )
 
 
 def get_train_val_datasources(
     labels_path: str | Path = SET6_MAX_SCALE_GOOD_PATH,
     master_index_path: str | Path = MASTER_INDEX_PATH,
+    taxon_index_path: str | Path = MASTER_TAXON_INDEX_PATH,
     ratio: float = 0.2,
 ):
     with open(master_index_path, "r") as f:
         master_index = json.load(f)
+
+    with open(taxon_index_path, "r") as f:
+        master_taxons = json.load(f)
 
     labels_df = pl.read_csv(labels_path, separator="\t")
 
     all_protein_ids = []
     all_terms = []
     all_emb_indices = []
+    all_taxons = []
 
     for row in labels_df.iter_rows(named=True):
         pid = row["id"]
@@ -154,6 +162,7 @@ def get_train_val_datasources(
             all_protein_ids.append(pid)
             all_terms.append(row["go_term"].split(","))
             all_emb_indices.append(master_index[pid])
+            all_taxons.append(master_taxons[pid])
 
     indices = list(range(len(all_protein_ids)))
     random.seed(42)
@@ -166,39 +175,17 @@ def get_train_val_datasources(
     train_pids = [all_protein_ids[i] for i in train_indices]
     train_terms = [all_terms[i] for i in train_indices]
     train_emb_idx = [all_emb_indices[i] for i in train_indices]
+    train_taxons = [all_taxons[i] for i in train_indices]
 
     val_pids = [all_protein_ids[i] for i in val_indices]
     val_terms = [all_terms[i] for i in val_indices]
     val_emb_idx = [all_emb_indices[i] for i in val_indices]
+    val_taxons = [all_taxons[i] for i in val_indices]
 
-    train_ds = TrainDataSource(train_pids, train_terms, train_emb_idx)
-    val_ds = TrainDataSource(val_pids, val_terms, val_emb_idx)
+    train_ds = TrainDataSource(train_pids, train_terms, train_emb_idx, train_taxons)
+    val_ds = TrainDataSource(val_pids, val_terms, val_emb_idx, val_taxons)
 
     return train_ds, val_ds, len(train_indices)
-
-
-def get_train_datasource(labels_path: str | Path = SET6_MAX_SCALE_GOOD_PATH):
-    with open(MASTER_INDEX_PATH, "r") as f:
-        master_index = json.load(f)
-
-    labels_df = pl.read_csv(labels_path, separator="\t")
-
-    protein_ids = []
-    terms = []
-    emb_indices = []
-
-    for row in labels_df.iter_rows(named=True):
-        pid = row["id"]
-        if pid in master_index:
-            protein_ids.append(pid)
-            terms.append(row["go_term"].split(","))
-            emb_indices.append(master_index[pid])
-
-    return TrainDataSource(protein_ids, terms, emb_indices)
-
-
-def get_test_datasource():
-    return TestDataSource()
 
 
 def get_train_transforms(batch_size: int = 128, drop_remainder: bool = True):

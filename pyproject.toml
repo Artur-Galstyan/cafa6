@@ -20,6 +20,7 @@ dependencies = [
     "optax>=0.2.6",
     "polars>=1.36.1",
     "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1",
     "tqdm>=4.67.1",
     "voyageai>=0.3.7",
 ]
