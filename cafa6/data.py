@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from beartype.typing import Literal, SupportsIndex
+from beartype.typing import SupportsIndex
 from Bio import SeqIO
 from grain import DataLoader, ReadOptions
 from grain.samplers import IndexSampler
@@ -12,6 +12,7 @@ from grain.sharding import ShardOptions
 from grain.sources import RandomAccessDataSource
 from grain.transforms import Batch, Map
 
+from cafa6.config import TrainConfig
 from cafa6.constants import (
     DATA_BASE_PATH,
     IA_PATH,
@@ -54,7 +55,18 @@ def _load_raw_embeddings(prefix: str = "master_600m"):
         with open(idx_path, "r") as f:
             _SHARED_RAW_EMBEDDINGS_IDX = json.load(f)
 
-        _SHARED_RAW_EMBEDDINGS = np.memmap(str(data_path), dtype="float16", mode="r")
+        total_residues = max(
+            meta["start"] + meta["length"]
+            for meta in _SHARED_RAW_EMBEDDINGS_IDX.values()
+        )
+        embedding_dim = 1152
+
+        _SHARED_RAW_EMBEDDINGS = np.memmap(
+            str(data_path),
+            dtype="float16",  # make sure this matches what you wrote
+            mode="r",
+            shape=(total_residues, embedding_dim),
+        )
     return _SHARED_RAW_EMBEDDINGS, _SHARED_RAW_EMBEDDINGS_IDX
 
 
@@ -138,10 +150,10 @@ class TrainMapTransformMean(Map):
 
 
 class TrainMapTransformRaw(Map):
-    def __init__(self, terms_to_idx: dict[str, int], max_len: int = 1024):
+    def __init__(self, terms_to_idx: dict[str, int], config: TrainConfig):
         self.terms_to_idx = terms_to_idx
         self.n_terms = len(terms_to_idx)
-        self.max_len = max_len
+        self.max_len = config.max_seq_len
         self.embedding_dim = 1152
 
     def map(self, element: tuple[str, list[str], int, int]):
@@ -152,10 +164,11 @@ class TrainMapTransformRaw(Map):
         start = meta["start"]
         length = meta["length"]
 
-        raw_seq = raw_data[start : start + length]
+        actual_len = min(length, self.max_len)
+        raw_seq = raw_data[start : start + actual_len]
 
         padded = np.zeros((self.max_len, self.embedding_dim), dtype=np.float32)
-        padded[:length] = raw_seq.astype(np.float32)
+        padded[:actual_len] = raw_seq.astype(np.float32)
 
         indices = [self.terms_to_idx[t] for t in terms if t in self.terms_to_idx]
         labels = np.zeros(self.n_terms, dtype=np.float32)
@@ -174,9 +187,9 @@ class TestMapTransformMean(Map):
 
 
 class TestMapTransformRaw(Map):
-    def __init__(self, max_len: int = 1024):
-        self.max_len = max_len
-        self.embedding_dim = 1152
+    def __init__(self, config: TrainConfig):
+        self.max_len = config.max_seq_len
+        self.embedding_dim = config.esm_embedding_size
 
     def map(self, element: tuple[str, int, int]):
         raw_data, raw_idx = _load_raw_embeddings()
@@ -186,9 +199,11 @@ class TestMapTransformRaw(Map):
         start = meta["start"]
         length = meta["length"]
 
-        raw_seq = raw_data[start : start + length]
+        actual_len = min(length, self.max_len)
+        raw_seq = raw_data[start : start + actual_len]
+
         padded = np.zeros((self.max_len, self.embedding_dim), dtype=np.float32)
-        padded[:length] = raw_seq.astype(np.float32)
+        padded[:actual_len] = raw_seq.astype(np.float32)
 
         return (protein_id, padded, int(taxon))
 
@@ -245,8 +260,7 @@ def get_train_val_datasources(
 
 
 def get_train_transforms(
-    dataset_type: Literal["mean", "raw"],
-    batch_size: int = 128,
+    config: TrainConfig,
     drop_remainder: bool = True,
 ):
     terms_to_idx = {}
@@ -254,64 +268,58 @@ def get_train_transforms(
     for i, row in enumerate(ia_df.iter_rows(named=True)):
         terms_to_idx[row["term"]] = i
 
-    if dataset_type == "raw":
-        transform = TrainMapTransformRaw(terms_to_idx)
+    if config.used_dataset == "raw":
+        transform = TrainMapTransformRaw(terms_to_idx, config)
     else:
         transform = TrainMapTransformMean(terms_to_idx)
 
     return [
         transform,
-        Batch(batch_size=batch_size, drop_remainder=drop_remainder),
+        Batch(batch_size=config.batch_size, drop_remainder=drop_remainder),
     ]
 
 
 def get_val_transforms(
-    dataset_type: Literal["mean", "raw"],
-    batch_size: int = 128,
-    drop_remainder: bool = False,
+    config: TrainConfig,
+    drop_remainder: bool = True,
 ):
     terms_to_idx = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
     for i, row in enumerate(ia_df.iter_rows(named=True)):
         terms_to_idx[row["term"]] = i
 
-    if dataset_type == "raw":
-        transform = TrainMapTransformRaw(terms_to_idx)
+    if config.used_dataset == "raw":
+        transform = TrainMapTransformRaw(terms_to_idx, config)
     else:
         transform = TrainMapTransformMean(terms_to_idx)
 
     return [
         transform,
-        Batch(batch_size=batch_size, drop_remainder=drop_remainder),
+        Batch(batch_size=config.batch_size, drop_remainder=drop_remainder),
     ]
 
 
 def get_test_transforms(
-    dataset_type: Literal["mean", "raw"],
-    batch_size: int = 128,
-    drop_remainder: bool = False,
+    config: TrainConfig,
+    drop_remainder: bool = True,
 ):
-    if dataset_type == "raw":
-        transform = TestMapTransformRaw()
+    if config.used_dataset == "raw":
+        transform = TestMapTransformRaw(config=config)
     else:
         transform = TestMapTransformMean()
 
     return [
         transform,
-        Batch(batch_size=batch_size, drop_remainder=drop_remainder),
+        Batch(batch_size=config.batch_size, drop_remainder=drop_remainder),
     ]
 
 
 def create_train_loader(
-    train_data_source: TrainDataSource,
-    transformations: list,
-    batch_size: int = 128,
-    num_epochs: int = 8,
-    worker_count: int = 0,
+    train_data_source: TrainDataSource, transformations: list, config: TrainConfig
 ):
     train_sampler = IndexSampler(
         num_records=len(train_data_source),
-        num_epochs=num_epochs,
+        num_epochs=config.num_epochs,
         shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
         shuffle=True,
         seed=42,
@@ -320,7 +328,7 @@ def create_train_loader(
         data_source=train_data_source,
         operations=transformations,
         sampler=train_sampler,
-        worker_count=worker_count,
+        worker_count=config.worker_count,
         read_options=ReadOptions(prefetch_buffer_size=16, num_threads=8),
     )
 
@@ -328,12 +336,12 @@ def create_train_loader(
 def create_val_loader(
     val_data_source: TrainDataSource,
     transformations: list,
-    worker_count: int = 0,
+    config: TrainConfig,
 ):
     val_sampler = IndexSampler(
         num_records=len(val_data_source),
         num_epochs=1,
-        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=False),
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
         shuffle=False,
         seed=42,
     )
@@ -341,22 +349,20 @@ def create_val_loader(
         data_source=val_data_source,
         operations=transformations,
         sampler=val_sampler,
-        worker_count=worker_count,
+        worker_count=config.worker_count,
     )
 
 
 def get_test_loader(
-    dataset_type: Literal["mean", "raw"] = "mean",
-    batch_size: int = 128,
-    worker_count: int = 4,
+    config: TrainConfig,
 ):
     test_data_source = TestDataSource()
-    transformations = get_test_transforms(dataset_type, batch_size=batch_size)
+    transformations = get_test_transforms(config=config)
 
     sampler = IndexSampler(
         num_records=len(test_data_source),
         num_epochs=1,
-        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=False),
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
         shuffle=False,
         seed=42,
     )
@@ -364,5 +370,5 @@ def get_test_loader(
         data_source=test_data_source,
         operations=transformations,
         sampler=sampler,
-        worker_count=worker_count,
+        worker_count=config.worker_count,
     )

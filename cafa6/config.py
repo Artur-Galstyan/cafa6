@@ -15,17 +15,20 @@ class TrainConfig(BaseModel):
     n_terms: int = 40_122
     n_deepgo_models: int = 1
     n_taxons: int = 8453
-    batch_size: int = 4096
+    batch_size: int = 18
     accumulation_steps: int = 4
     # batch_size: int = 16384 * 2
     taxon_embedding_size: int = 1024
     learning_rate: float = 0.0009
     num_epochs: int = 80
-    worker_count: int = 2
+    worker_count: int = 4
     patience: int = 15
+
+    max_seq_len: int = 512
 
     ratio: float = 0.15
     training_set: str = TrainingSets.SET_6_MAX_SCALE_GOOD
+    # training_set: str = TrainingSets.SET_1_TRAIN_TEST_GOOD
 
     esm_model: str = "esmc_600m"
 

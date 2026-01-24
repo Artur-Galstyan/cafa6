@@ -1,6 +1,12 @@
 import json
+import os
 from pathlib import Path
 from typing import cast
+
+# Disable Triton GEMM to avoid autotuning failures with unusual tensor shapes during inference
+os.environ["XLA_FLAGS"] = (
+    os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_triton_gemm=false"
+)
 
 import equinox as eqx
 import jax
@@ -22,9 +28,14 @@ from cafa6.model import Model
 
 
 @eqx.filter_jit
-def _get_preds(model, data_input: tuple):
-    preds = eqx.filter_vmap(model, in_axes=(0, 0, None, None))(
-        *data_input,
+def _get_preds(model, data_input: tuple, batch_size: int):
+    esm_emb, taxon, condition = data_input
+    # Replicate condition for each sample in batch to match training behavior
+    condition_batched = jnp.broadcast_to(condition, (batch_size, 1))
+    preds = eqx.filter_vmap(model)(
+        esm_emb,
+        taxon,
+        condition_batched,
         None,
     )
     preds = jax.nn.sigmoid(preds)
@@ -36,8 +47,7 @@ def create_submission(
     model: Model | None = None,
     data_loader: DataLoader | None = None,
     preds_per_term: int = 50,
-    batch_size: int = 128,
-    worker_count: int = 4,
+    model_config: TrainConfig | None = None,
     tta_conditions: list[float] | None = None,
     save: bool = False,
     include_partial: bool = True,
@@ -72,7 +82,8 @@ def create_submission(
     idx_to_term = {i: row["term"] for i, row in enumerate(ia_df.iter_rows(named=True))}
 
     if not data_loader:
-        data_loader = get_test_loader(batch_size, worker_count)
+        assert model_config is not None
+        data_loader = get_test_loader(model_config)
 
     buffer_ids = []
     buffer_indices = []
@@ -91,9 +102,10 @@ def create_submission(
         model_inputs = tuple(jnp.array(m) for m in model_inputs)
 
         all_preds = []
+        batch_size = model_inputs[0].shape[0]
         for cond_val in tta_conditions:
             condition = jnp.array([cond_val])
-            preds = _get_preds(model, model_inputs + (condition,))
+            preds = _get_preds(model, model_inputs + (condition,), batch_size)
             all_preds.append(preds)
 
         avg_preds = jnp.stack(all_preds).mean(axis=0)

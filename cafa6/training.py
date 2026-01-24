@@ -3,6 +3,9 @@ import os
 from beartype.typing import Literal
 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["XLA_FLAGS"] = (
+    os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_triton_gemm=false"
+)
 
 import json
 
@@ -10,6 +13,7 @@ import coolname
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.sharding as jshard
 import mlflow
 import optax
 import polars as pl
@@ -32,6 +36,13 @@ from cafa6.data import (
 from cafa6.eval import evaluate
 from cafa6.model import Model
 from cafa6.utils import get_graph_edges
+
+num_devices = len(jax.devices())
+# num_devices = 1
+# Use Auto axis type to maintain compatibility with eqx.filter_shard / with_sharding_constraint
+mesh = jax.make_mesh((num_devices,), ("batch",), axis_types=(jshard.AxisType.Auto,))
+data_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec("batch"))
+model_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec())
 
 
 def _setup_mlflow():
@@ -120,7 +131,7 @@ def loss_fn(
     return base_loss + axiom_loss_value + 0.3 * hierarchy_loss_value
 
 
-@eqx.filter_jit
+@eqx.filter_jit(donate="all")
 def step_fn(
     model: PyTree,
     X: tuple[Array, ...],
@@ -173,20 +184,10 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
         ratio=train_config.ratio,
     )
 
-    train_transforms = get_train_transforms(
-        dataset_type=train_config.used_dataset, batch_size=train_config.batch_size
-    )
-    val_transforms = get_val_transforms(
-        dataset_type=train_config.used_dataset, batch_size=train_config.batch_size
-    )
+    train_transforms = get_train_transforms(config=train_config)
+    val_transforms = get_val_transforms(train_config)
 
-    train_data_loader = create_train_loader(
-        train_ds,
-        train_transforms,
-        train_config.batch_size,
-        train_config.num_epochs,
-        train_config.worker_count,
-    )
+    train_data_loader = create_train_loader(train_ds, train_transforms, train_config)
 
     best_model = model
     children, parents = get_graph_edges(terms_to_idx)
@@ -208,6 +209,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     )
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    model, opt_state = eqx.filter_shard((model, opt_state), model_sharding)
     key = jax.random.key(1)
 
     with mlflow.start_run(description=model_name, run_name=model_name):
@@ -229,9 +231,11 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
             model_inputs = tuple(jnp.array(m) for m in model_inputs)
             y = jnp.array(y)
 
+            x, y = eqx.filter_shard((model_inputs, y), data_sharding)
+
             model, opt_state, loss = step_fn(
                 model,
-                model_inputs,
+                x,
                 y,
                 optimizer,
                 opt_state,
@@ -243,13 +247,13 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
             mlflow.log_metric("train_loss", curr_loss, step=step)
             epoch_loss += curr_loss
 
-            if (step + 1) % (steps_per_epoch * 5) == 0:
+            if (step + 1) % (steps_per_epoch) == 0:
                 epoch += 1
                 avg_loss = epoch_loss / steps_per_epoch
                 epoch_loss = 0.0
 
-                val_loader = create_val_loader(val_ds, val_transforms)
-                score = evaluate(model, val_loader)
+                val_loader = create_val_loader(val_ds, val_transforms, train_config)
+                score = evaluate(model, val_loader, train_config)
 
                 mlflow.log_metric("validation_score", score, step=step)
                 mlflow.log_metric("epoch_avg_loss", avg_loss, step=step)
@@ -277,5 +281,5 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
 
 
 def main(gpu: Literal[0, 1] = 0):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     train()

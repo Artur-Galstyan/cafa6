@@ -4,6 +4,7 @@ from pathlib import Path
 import polars as pl
 from cafaeval.evaluation import cafa_score_dfs
 
+from cafa6.config import TrainConfig
 from cafa6.constants import (
     IA_PATH,
     IA_PATH_NO_HEAD,
@@ -44,15 +45,16 @@ def get_terms_to_idx() -> dict[str, int]:
 def evaluate(
     model,
     val_data_loader,
+    config: TrainConfig,
     ground_truth_path: str | Path = SET6_MAX_SCALE_GOOD_PATH,
 ):
     submission = create_submission(
         model=model,
         data_loader=val_data_loader,
-        worker_count=0,
         preds_per_term=50,
         include_partial=False,
         is_val=True,
+        model_config=config,
     )
     submission = submission.rename(
         {"EntryID": "protein_id", "term": "term_id", "value": "score"}
