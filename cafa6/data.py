@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from beartype.typing import SupportsIndex
+from beartype.typing import Literal, SupportsIndex
 from Bio import SeqIO
 from grain import DataLoader, ReadOptions
 from grain.samplers import IndexSampler
@@ -13,6 +13,7 @@ from grain.sources import RandomAccessDataSource
 from grain.transforms import Batch, Map
 
 from cafa6.constants import (
+    DATA_BASE_PATH,
     IA_PATH,
     MASTER_EMBEDDINGS_PATH,
     MASTER_INDEX_PATH,
@@ -23,6 +24,9 @@ from cafa6.constants import (
 
 _SHARED_EMBEDDINGS = None
 _SHARED_EMBEDDINGS_IDX = None
+
+_SHARED_RAW_EMBEDDINGS = None
+_SHARED_RAW_EMBEDDINGS_IDX = None
 
 
 def _load_master_embeddings():
@@ -39,6 +43,19 @@ def _load_master_embeddings():
             shape=(num_proteins, embedding_dim),
         )
     return _SHARED_EMBEDDINGS, _SHARED_EMBEDDINGS_IDX
+
+
+def _load_raw_embeddings(prefix: str = "master_600m"):
+    global _SHARED_RAW_EMBEDDINGS, _SHARED_RAW_EMBEDDINGS_IDX
+    if _SHARED_RAW_EMBEDDINGS is None:
+        idx_path = DATA_BASE_PATH / f"{prefix}_raw_index.json"
+        data_path = DATA_BASE_PATH / f"{prefix}_raw_embeddings.dat"
+
+        with open(idx_path, "r") as f:
+            _SHARED_RAW_EMBEDDINGS_IDX = json.load(f)
+
+        _SHARED_RAW_EMBEDDINGS = np.memmap(str(data_path), dtype="float16", mode="r")
+    return _SHARED_RAW_EMBEDDINGS, _SHARED_RAW_EMBEDDINGS_IDX
 
 
 class TrainDataSource(RandomAccessDataSource):
@@ -102,16 +119,14 @@ class TestDataSource(RandomAccessDataSource):
         )
 
 
-class TrainMapTransform(Map):
+class TrainMapTransformMean(Map):
     def __init__(self, terms_to_idx: dict[str, int]):
         self.terms_to_idx = terms_to_idx
         self.n_terms = len(terms_to_idx)
 
     def map(self, element: tuple[str, list[str], int, int]):
         embeddings, _ = _load_master_embeddings()
-
         protein_id, terms, emb_idx, taxon = element
-
         esm_embedding = embeddings[emb_idx]
 
         indices = [self.terms_to_idx[t] for t in terms if t in self.terms_to_idx]
@@ -122,19 +137,60 @@ class TrainMapTransform(Map):
         return (protein_id, esm_embedding, int(taxon), labels)
 
 
-class TestMapTransform(Map):
+class TrainMapTransformRaw(Map):
+    def __init__(self, terms_to_idx: dict[str, int], max_len: int = 1024):
+        self.terms_to_idx = terms_to_idx
+        self.n_terms = len(terms_to_idx)
+        self.max_len = max_len
+        self.embedding_dim = 1152
+
+    def map(self, element: tuple[str, list[str], int, int]):
+        raw_data, raw_idx = _load_raw_embeddings()
+        protein_id, terms, _, taxon = element
+
+        meta = raw_idx[protein_id]
+        start = meta["start"]
+        length = meta["length"]
+
+        raw_seq = raw_data[start : start + length]
+
+        padded = np.zeros((self.max_len, self.embedding_dim), dtype=np.float32)
+        padded[:length] = raw_seq.astype(np.float32)
+
+        indices = [self.terms_to_idx[t] for t in terms if t in self.terms_to_idx]
+        labels = np.zeros(self.n_terms, dtype=np.float32)
+        if indices:
+            labels[indices] = 1.0
+
+        return (protein_id, padded, int(taxon), labels)
+
+
+class TestMapTransformMean(Map):
     def map(self, element: tuple[str, int, int]):
         embeddings, _ = _load_master_embeddings()
-
         protein_id, emb_idx, taxon = element
-
         esm_embedding = embeddings[emb_idx]
+        return (protein_id, esm_embedding, int(taxon))
 
-        return (
-            protein_id,
-            esm_embedding,
-            int(taxon),
-        )
+
+class TestMapTransformRaw(Map):
+    def __init__(self, max_len: int = 1024):
+        self.max_len = max_len
+        self.embedding_dim = 1152
+
+    def map(self, element: tuple[str, int, int]):
+        raw_data, raw_idx = _load_raw_embeddings()
+        protein_id, _, taxon = element
+
+        meta = raw_idx[protein_id]
+        start = meta["start"]
+        length = meta["length"]
+
+        raw_seq = raw_data[start : start + length]
+        padded = np.zeros((self.max_len, self.embedding_dim), dtype=np.float32)
+        padded[:length] = raw_seq.astype(np.float32)
+
+        return (protein_id, padded, int(taxon))
 
 
 def get_train_val_datasources(
@@ -188,33 +244,60 @@ def get_train_val_datasources(
     return train_ds, val_ds, len(train_indices)
 
 
-def get_train_transforms(batch_size: int = 128, drop_remainder: bool = True):
+def get_train_transforms(
+    dataset_type: Literal["mean", "raw"],
+    batch_size: int = 128,
+    drop_remainder: bool = True,
+):
     terms_to_idx = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
     for i, row in enumerate(ia_df.iter_rows(named=True)):
         terms_to_idx[row["term"]] = i
 
+    if dataset_type == "raw":
+        transform = TrainMapTransformRaw(terms_to_idx)
+    else:
+        transform = TrainMapTransformMean(terms_to_idx)
+
     return [
-        TrainMapTransform(terms_to_idx),
+        transform,
         Batch(batch_size=batch_size, drop_remainder=drop_remainder),
     ]
 
 
-def get_val_transforms(batch_size: int = 128, drop_remainder: bool = False):
+def get_val_transforms(
+    dataset_type: Literal["mean", "raw"],
+    batch_size: int = 128,
+    drop_remainder: bool = False,
+):
     terms_to_idx = {}
     ia_df = pl.read_csv(IA_PATH, separator="\t")
     for i, row in enumerate(ia_df.iter_rows(named=True)):
         terms_to_idx[row["term"]] = i
 
+    if dataset_type == "raw":
+        transform = TrainMapTransformRaw(terms_to_idx)
+    else:
+        transform = TrainMapTransformMean(terms_to_idx)
+
     return [
-        TrainMapTransform(terms_to_idx),
+        transform,
         Batch(batch_size=batch_size, drop_remainder=drop_remainder),
     ]
 
 
-def get_test_transforms(batch_size: int = 128, drop_remainder: bool = False):
+def get_test_transforms(
+    dataset_type: Literal["mean", "raw"],
+    batch_size: int = 128,
+    drop_remainder: bool = False,
+):
+    if dataset_type == "raw":
+        transform = TestMapTransformRaw()
+    else:
+        transform = TestMapTransformMean()
+
     return [
-        TestMapTransform(),
+        transform,
         Batch(batch_size=batch_size, drop_remainder=drop_remainder),
     ]
 
@@ -262,9 +345,13 @@ def create_val_loader(
     )
 
 
-def get_test_loader(batch_size: int = 128, worker_count: int = 4):
+def get_test_loader(
+    dataset_type: Literal["mean", "raw"] = "mean",
+    batch_size: int = 128,
+    worker_count: int = 4,
+):
     test_data_source = TestDataSource()
-    transformations = get_test_transforms(batch_size=batch_size)
+    transformations = get_test_transforms(dataset_type, batch_size=batch_size)
 
     sampler = IndexSampler(
         num_records=len(test_data_source),

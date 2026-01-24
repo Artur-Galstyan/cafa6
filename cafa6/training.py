@@ -172,8 +172,13 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
         labels_path=labels_path,
         ratio=train_config.ratio,
     )
-    train_transforms = get_train_transforms(batch_size=train_config.batch_size)
-    val_transforms = get_val_transforms(batch_size=train_config.batch_size)
+
+    train_transforms = get_train_transforms(
+        dataset_type=train_config.used_dataset, batch_size=train_config.batch_size
+    )
+    val_transforms = get_val_transforms(
+        dataset_type=train_config.used_dataset, batch_size=train_config.batch_size
+    )
 
     train_data_loader = create_train_loader(
         train_ds,
@@ -203,7 +208,6 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     )
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-    # model, opt_state = eqx.filter_shard((model, opt_state), model_sharding)
     key = jax.random.key(1)
 
     with mlflow.start_run(description=model_name, run_name=model_name):

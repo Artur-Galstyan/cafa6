@@ -1,3 +1,4 @@
+from beartype.typing import Literal
 from pydantic import BaseModel
 
 
@@ -42,3 +43,6 @@ class TrainConfig(BaseModel):
 
     gate_mlp_width_size: int = 2048
     gate_mlp_depth: int = 3
+
+    used_dataset: Literal["raw", "mean"] = "raw"
+    # used_dataset: Literal["raw", "mean"] = "mean"
