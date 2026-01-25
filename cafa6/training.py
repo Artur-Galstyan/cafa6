@@ -247,7 +247,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
             mlflow.log_metric("train_loss", curr_loss, step=step)
             epoch_loss += curr_loss
 
-            if (step + 1) % (steps_per_epoch) == 0:
+            if (step + 1) % (steps_per_epoch * 5) == 0:
                 epoch += 1
                 avg_loss = epoch_loss / steps_per_epoch
                 epoch_loss = 0.0
