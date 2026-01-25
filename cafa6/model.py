@@ -10,7 +10,7 @@ class DeepGOModel(eqx.Module):
     term_centers: eqx.nn.Embedding
     term_radii: Array
     has_function: Array
-    cross_attn: eqx.nn.MultiheadAttention
+    # cross_attn: eqx.nn.MultiheadAttention
     mlp: eqx.nn.MLP
 
     def __init__(
@@ -29,17 +29,17 @@ class DeepGOModel(eqx.Module):
             key=fn_key, shape=(config.deepgo_se_embedding_size,)
         )
 
-        self.cross_attn = eqx.nn.MultiheadAttention(
-            num_heads=8,
-            query_size=config.deepgo_se_embedding_size,
-            key_size=config.esm_embedding_size,
-            value_size=config.esm_embedding_size,
-            output_size=config.deepgo_se_embedding_size,
-            key=attn_key,
-        )
+        # self.cross_attn = eqx.nn.MultiheadAttention(
+        #     num_heads=8,
+        #     query_size=config.deepgo_se_embedding_size,
+        #     key_size=config.esm_embedding_size,
+        #     value_size=config.esm_embedding_size,
+        #     output_size=config.deepgo_se_embedding_size,
+        #     key=attn_key,
+        # )
 
         self.mlp = eqx.nn.MLP(
-            in_size=config.deepgo_se_embedding_size,
+            in_size=config.esm_embedding_size,
             out_size=config.deepgo_se_embedding_size,
             width_size=config.esm_proj_width_size,
             depth=config.esm_proj_depth,
@@ -49,19 +49,20 @@ class DeepGOModel(eqx.Module):
 
     def __call__(
         self,
-        esm_emb: Float[Array, "seq_len esm_dim"],
+        esm_emb: Array,
         key: PRNGKeyArray | None = None,
     ):
-        term_emb = self.term_centers.weight
+        # term_emb = self.term_centers.weight
 
-        attended = self.cross_attn(
-            query=term_emb,
-            key_=esm_emb,
-            value=esm_emb,
-            inference=True,
-        )
+        # attended = self.cross_attn(
+        #     query=term_emb,
+        #     key_=esm_emb,
+        #     value=esm_emb,
+        #     inference=True,
+        # )
 
-        protein_aware_terms = eqx.filter_vmap(self.mlp)(attended)
+        # protein_aware_terms = eqx.filter_vmap(self.mlp)(esm_emb)
+        protein_aware_terms = self.mlp(esm_emb)
         shifted = protein_aware_terms + self.has_function
 
         scores = jnp.sum(shifted, axis=-1) + self.term_radii.squeeze()
@@ -118,6 +119,7 @@ class Model(eqx.Module):
         condition: Float[Array, "1"],
         key: PRNGKeyArray | None = None,
     ):
+        print(f"{esm_emb.shape=}")
         esm_emb = self.dropout(esm_emb, key=key)
         esm_emb += self.condition_mlp(condition)
         deepgo_logits = self.deepgo(esm_emb)

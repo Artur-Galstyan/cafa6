@@ -15,7 +15,7 @@ class TrainConfig(BaseModel):
     n_terms: int = 40_122
     n_deepgo_models: int = 1
     n_taxons: int = 8453
-    batch_size: int = 18
+    batch_size: int = 2048
     accumulation_steps: int = 4
     # batch_size: int = 16384 * 2
     taxon_embedding_size: int = 1024
@@ -47,5 +47,5 @@ class TrainConfig(BaseModel):
     gate_mlp_width_size: int = 2048
     gate_mlp_depth: int = 3
 
-    used_dataset: Literal["raw", "mean"] = "raw"
-    # used_dataset: Literal["raw", "mean"] = "mean"
+    # used_dataset: Literal["raw", "mean"] = "raw"
+    used_dataset: Literal["raw", "mean"] = "mean"

@@ -37,8 +37,8 @@ from cafa6.eval import evaluate
 from cafa6.model import Model
 from cafa6.utils import get_graph_edges
 
-num_devices = len(jax.devices())
-# num_devices = 1
+# num_devices = len(jax.devices())
+num_devices = 1
 # Use Auto axis type to maintain compatibility with eqx.filter_shard / with_sharding_constraint
 mesh = jax.make_mesh((num_devices,), ("batch",), axis_types=(jshard.AxisType.Auto,))
 data_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec("batch"))
@@ -185,7 +185,7 @@ def train(train_config: TrainConfig = TrainConfig(), model_name: str | None = No
     )
 
     train_transforms = get_train_transforms(config=train_config)
-    val_transforms = get_val_transforms(train_config)
+    val_transforms = get_val_transforms(train_config, drop_remainder=False)
 
     train_data_loader = create_train_loader(train_ds, train_transforms, train_config)
 

@@ -341,7 +341,7 @@ def create_val_loader(
     val_sampler = IndexSampler(
         num_records=len(val_data_source),
         num_epochs=1,
-        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=True),
+        shard_options=ShardOptions(shard_index=0, shard_count=1, drop_remainder=False),
         shuffle=False,
         seed=42,
     )
